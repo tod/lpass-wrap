@@ -21,7 +21,8 @@ Example::
     client.upsert("Homelab/My Secret", username="svc", password="newpass")
 """
 
-import re
+import json
+import os
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -31,6 +32,7 @@ import structlog
 from .exceptions import (
     LpassCommandError,
     LpassItemNotFoundError,
+    LpassMultipleMatchesError,
     LpassNotLoggedInError,
     LpassParseError,
 )
@@ -40,9 +42,6 @@ if TYPE_CHECKING:
     pass
 
 log = structlog.get_logger(__name__)
-
-# Matches the first line of ``lpass show`` output: "Item Name [12345678901]"
-_ID_RE = re.compile(r"\[(\d+)\]")
 
 
 class LpassClient:
@@ -120,6 +119,52 @@ class LpassClient:
             )
         self.login()
 
+    # ── Sync diagnostics ───────────────────────────────────────────────────
+
+    def pending_sync_count(self) -> int:
+        """Return the number of items waiting to be uploaded to LastPass.
+
+        Reads the lpass upload-queue directory, which holds one file per item
+        that has been written locally but not yet pushed to the server.  A
+        non-zero count means previous writes may not be visible to other
+        clients and is the likely cause of duplicate-item symptoms.
+
+        The directory is resolved from ``$LPASS_HOME`` (defaulting to
+        ``~/.lpass``), matching how the lpass CLI itself locates it.
+
+        Returns:
+            Count of pending items (0 if the queue is empty or doesn't exist).
+        """
+        lpass_home = os.environ.get("LPASS_HOME", os.path.expanduser("~/.lpass"))
+        queue_dir = os.path.join(lpass_home, "upload-queue")
+        try:
+            return len(os.listdir(queue_dir))
+        except FileNotFoundError:
+            return 0
+
+    def failed_sync_count(self) -> int:
+        """Return the number of items that permanently failed to upload.
+
+        After five retry attempts with exponential backoff, the lpass CLI
+        moves items from the upload-queue to ``upload-fail/``.  These entries
+        remain there for up to 14 days before automatic cleanup.  A non-zero
+        count means writes have been permanently lost from the LastPass servers
+        and manual intervention is required.
+
+        The directory is resolved from ``$LPASS_HOME`` (defaulting to
+        ``~/.lpass``), matching how the lpass CLI itself locates it.
+
+        Returns:
+            Count of permanently failed items (0 if the directory is empty or
+            doesn't exist).
+        """
+        lpass_home = os.environ.get("LPASS_HOME", os.path.expanduser("~/.lpass"))
+        fail_dir = os.path.join(lpass_home, "upload-fail")
+        try:
+            return len(os.listdir(fail_dir))
+        except FileNotFoundError:
+            return 0
+
     # ── Item queries ───────────────────────────────────────────────────────
 
     def item_exists(self, item_name: str) -> bool:
@@ -144,7 +189,9 @@ class LpassClient:
         """Fetch a LastPass login item by name.
 
         Forces a sync (``--sync=now``) so that items created in the same
-        session are always visible.
+        session are always visible.  Uses ``--json --expand-multi`` so that
+        duplicate entries (multiple items sharing the same name) are detected
+        reliably rather than silently returning garbage data.
 
         Args:
             item_name: The LastPass item name or folder path.
@@ -153,18 +200,29 @@ class LpassClient:
             An :class:`~lpass_wrap.models.LpassItem` populated from lpass output.
 
         Raises:
-            LpassItemNotFoundError: If no item with that name exists.
-            LpassParseError:        If the lpass output cannot be parsed.
+            LpassItemNotFoundError:      If no item with that name exists.
+            LpassMultipleMatchesError:   If more than one item shares that name.
+            LpassParseError:             If the lpass JSON output cannot be parsed.
         """
         result = subprocess.run(
-            ["lpass", "show", "--sync=now", item_name],
+            ["lpass", "show", "--sync=now", "--json", "--expand-multi", item_name],
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             raise LpassItemNotFoundError(item_name)
 
-        return self._parse_show_output(item_name, result.stdout)
+        try:
+            items = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise LpassParseError(result.stdout) from exc
+
+        if not items:
+            raise LpassItemNotFoundError(item_name)
+        if len(items) > 1:
+            raise LpassMultipleMatchesError(item_name, len(items))
+
+        return self._item_from_json(items[0], item_name)
 
     def get_field(self, item_name: str, flag: str) -> str:
         """Fetch a single field from a LastPass item.
@@ -275,6 +333,12 @@ class LpassClient:
 
         See :meth:`create` for the rationale behind the two-command approach.
 
+        Note:
+            Due to lpass CLI behaviour, if no item with ``item_name`` exists,
+            ``lpass edit`` will silently create a new one rather than failing.
+            Call :meth:`upsert` instead of this method directly when the item
+            may or may not exist.
+
         Args:
             item_name: The LastPass item name or folder path.
             username:  New value for the Username field.
@@ -284,8 +348,7 @@ class LpassClient:
             The updated item fetched from LastPass.
 
         Raises:
-            LpassItemNotFoundError: If no item with that name exists.
-            LpassCommandError:      If either lpass command fails.
+            LpassCommandError: If either lpass command fails.
         """
         self._log.info("lpass_update", item=item_name)
         self._run_with_stdin(
@@ -302,8 +365,9 @@ class LpassClient:
     def upsert(self, item_name: str, username: str, password: str) -> LpassItem:
         """Create or update a LastPass login item.
 
-        Checks whether the item already exists and calls :meth:`create` or
-        :meth:`update` accordingly.
+        Uses :meth:`get_item` (which forces ``--sync=now``) to check existence,
+        avoiding the stale-cache race that :meth:`item_exists` (``--sync=no``)
+        would introduce when items are still in the upload queue.
 
         Args:
             item_name: The LastPass item name or folder path.
@@ -316,9 +380,11 @@ class LpassClient:
         Raises:
             LpassCommandError: If any lpass command fails.
         """
-        if self.item_exists(item_name):
+        try:
+            self.get_item(item_name)
             return self.update(item_name, username, password)
-        return self.create(item_name, username, password)
+        except LpassItemNotFoundError:
+            return self.create(item_name, username, password)
 
     # ── Internals ──────────────────────────────────────────────────────────
 
@@ -341,42 +407,21 @@ class LpassClient:
             raise LpassCommandError(subcommand, result.returncode, result.stderr)
         return result
 
-    def _parse_show_output(self, item_name: str, output: str) -> LpassItem:
-        """Parse the text output of ``lpass show`` into an :class:`LpassItem`.
-
-        The first line has the format ``"Item Name [12345678901]"``.
-        Subsequent lines are ``"Field: value"`` pairs.
+    def _item_from_json(self, data: dict, item_name: str) -> LpassItem:
+        """Build an :class:`LpassItem` from a single ``lpass show --json`` entry.
 
         Args:
-            item_name: The item name used for the query (used as fallback name).
-            output:    Raw stdout from ``lpass show``.
+            data:      One element from the JSON array returned by ``lpass show --json``.
+            item_name: The query name (used as the ``name`` field fallback).
 
         Returns:
             A populated :class:`~lpass_wrap.models.LpassItem`.
-
-        Raises:
-            LpassParseError: If the output is empty or cannot be parsed.
         """
-        if not output.strip():
-            raise LpassParseError(output)
-
-        lines = output.splitlines()
-        item_id = ""
-        id_match = _ID_RE.search(lines[0])
-        if id_match:
-            item_id = id_match.group(1)
-
-        fields: dict[str, str] = {}
-        for line in lines[1:]:
-            if ": " in line:
-                key, _, value = line.partition(": ")
-                fields[key.strip().lower()] = value.strip()
-
         return LpassItem(
             name=item_name,
-            item_id=item_id,
-            username=fields.get("username", ""),
-            password=fields.get("password", ""),
-            url=fields.get("url", ""),
-            notes=fields.get("notes", ""),
+            item_id=data.get("id", ""),
+            username=data.get("username", ""),
+            password=data.get("password", ""),
+            url=data.get("url", ""),
+            notes=data.get("note", ""),
         )

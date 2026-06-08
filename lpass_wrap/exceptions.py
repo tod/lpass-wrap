@@ -56,6 +56,34 @@ class LpassItemNotFoundError(LpassError):
         super().__init__(f"LastPass item not found: {item_name!r}")
 
 
+class LpassMultipleMatchesError(LpassError):
+    """Raised when a name matches more than one LastPass item.
+
+    Duplicate entries are typically caused by the upload-queue sync race:
+    a write that failed to reach the server gets re-created on the next run.
+    Use ``lpass ls`` to inspect duplicates and ``lpass rm`` with the unique
+    item ID to remove them.
+
+    Attributes:
+        item_name: The item name or path that matched multiple entries.
+        count:     The number of matching entries found.
+    """
+
+    def __init__(self, item_name: str, count: int) -> None:
+        """Initialise with the item name and number of duplicates found.
+
+        Args:
+            item_name: The LastPass item name or path that matched multiple entries.
+            count:     The number of matching entries found.
+        """
+        self.item_name = item_name
+        self.count = count
+        super().__init__(
+            f"LastPass item {item_name!r} matched {count} entries; "
+            "use lpass ls to inspect and lpass rm <UNIQUEID> to remove duplicates."
+        )
+
+
 class LpassParseError(LpassError):
     """Raised when lpass output cannot be parsed into an expected format.
 

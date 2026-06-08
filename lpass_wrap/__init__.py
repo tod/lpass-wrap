@@ -19,6 +19,7 @@ from .exceptions import (
     LpassCommandError,
     LpassError,
     LpassItemNotFoundError,
+    LpassMultipleMatchesError,
     LpassNotLoggedInError,
     LpassParseError,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "LpassError",
     "LpassCommandError",
     "LpassItemNotFoundError",
+    "LpassMultipleMatchesError",
     "LpassNotLoggedInError",
     "LpassParseError",
 ]
