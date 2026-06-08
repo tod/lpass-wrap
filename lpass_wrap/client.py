@@ -165,6 +165,30 @@ class LpassClient:
         except FileNotFoundError:
             return 0
 
+    def assert_sync_clean(self) -> None:
+        """Raise if any writes have not reached the LastPass server.
+
+        Checks both the upload-queue (pending) and upload-fail (permanently
+        failed) directories.  Call this at the end of any script that writes
+        to LastPass to confirm the background sync process completed.
+
+        Raises:
+            RuntimeError: If there are permanently failed items (checked
+                first — more severe) or items still pending upload.
+        """
+        failed = self.failed_sync_count()
+        pending = self.pending_sync_count()
+        if failed:
+            raise RuntimeError(
+                f"{failed} LastPass item(s) permanently failed to sync; "
+                "check $LPASS_HOME/upload-fail/ and re-run manually."
+            )
+        if pending:
+            raise RuntimeError(
+                f"{pending} LastPass item(s) still pending upload — "
+                "sync may be incomplete. Re-run or check network connectivity."
+            )
+
     # ── Item queries ───────────────────────────────────────────────────────
 
     def item_exists(self, item_name: str) -> bool:
@@ -300,10 +324,10 @@ class LpassClient:
     def create(self, item_name: str, username: str, password: str) -> LpassItem:
         """Create a new LastPass login item.
 
-        Uses two lpass commands — ``add --password`` to create the item,
-        then ``edit --username`` to set the username — because lpass field
-        flags are boolean selectors that read a single value from stdin.
-        This ensures neither value ever appears in a process argument list.
+        Uses a single ``lpass edit --non-interactive --sync=now`` call, which
+        creates the item if it does not exist.  Both Username and Password are
+        provided together via stdin as ``Field: value`` lines so neither value
+        ever appears in a process argument list and only one upload occurs.
 
         Args:
             item_name: The LastPass item name or folder path.
@@ -314,24 +338,21 @@ class LpassClient:
             The newly created item fetched from LastPass.
 
         Raises:
-            LpassCommandError: If either lpass command fails.
+            LpassCommandError: If the lpass command fails.
         """
         self._log.info("lpass_create", item=item_name)
+        fields = f"Username: {username}\nPassword: {password}\n" if username else f"Password: {password}\n"
         self._run_with_stdin(
-            ["lpass", "add", "--non-interactive", "--sync=now", "--password", item_name],
-            stdin=password,
+            ["lpass", "edit", "--non-interactive", "--sync=now", item_name],
+            stdin=fields,
         )
-        if username:
-            self._run_with_stdin(
-                ["lpass", "edit", "--non-interactive", "--sync=now", "--username", item_name],
-                stdin=username,
-            )
         return self.get_item(item_name)
 
     def update(self, item_name: str, username: str, password: str) -> LpassItem:
         """Update the username and password of an existing LastPass login item.
 
-        See :meth:`create` for the rationale behind the two-command approach.
+        Uses a single ``lpass edit --non-interactive --sync=now`` call with
+        both fields provided via stdin as ``Field: value`` lines.
 
         Note:
             Due to lpass CLI behaviour, if no item with ``item_name`` exists,
@@ -348,18 +369,14 @@ class LpassClient:
             The updated item fetched from LastPass.
 
         Raises:
-            LpassCommandError: If either lpass command fails.
+            LpassCommandError: If the lpass command fails.
         """
         self._log.info("lpass_update", item=item_name)
+        fields = f"Username: {username}\nPassword: {password}\n" if username else f"Password: {password}\n"
         self._run_with_stdin(
-            ["lpass", "edit", "--non-interactive", "--sync=now", "--password", item_name],
-            stdin=password,
+            ["lpass", "edit", "--non-interactive", "--sync=now", item_name],
+            stdin=fields,
         )
-        if username:
-            self._run_with_stdin(
-                ["lpass", "edit", "--non-interactive", "--sync=now", "--username", item_name],
-                stdin=username,
-            )
         return self.get_item(item_name)
 
     def upsert(self, item_name: str, username: str, password: str) -> LpassItem:

@@ -34,6 +34,7 @@ def main() -> None:
 | `update(name, username, password)` | Explicit update; **silently creates** if name not found (prefer `upsert`) |
 | `pending_sync_count()` | Number of items in `upload-queue/` — written locally but not yet pushed |
 | `failed_sync_count()` | Number of items in `upload-fail/` — permanently failed after 5 retries (kept 14 days) |
+| `assert_sync_clean()` | Raises `RuntimeError` if any items are pending or permanently failed; call after all writes |
 
 ## Exceptions
 
@@ -48,26 +49,14 @@ from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassN
 
 ## Verifying sync in automation scripts
 
-`--sync=now` enqueues the upload and starts a background process to push it — the calling script can exit before the upload completes. Always check queue depth after writes in unattended scripts:
+`--sync=now` enqueues the upload and starts a background process to push it — the calling script can exit before the upload completes. Always call `assert_sync_clean()` after writes:
 
 ```python
-def _assert_sync_clean(client: LpassClient) -> None:
-    """Raise if any writes did not reach the LastPass server."""
-    failed = client.failed_sync_count()
-    pending = client.pending_sync_count()
-    if failed:
-        raise RuntimeError(
-            f"{failed} LastPass item(s) permanently failed to sync; "
-            "check $LPASS_HOME/upload-fail/ and re-run manually."
-        )
-    if pending:
-        raise RuntimeError(
-            f"{pending} LastPass item(s) still pending upload — "
-            "sync may be incomplete. Re-run or check network connectivity."
-        )
+_lpass.upsert("Homelab/My Secret", username="svc", password=new_value)
+_lpass.assert_sync_clean()  # raises RuntimeError if pending or failed
 ```
 
-Call `_assert_sync_clean(client)` at the end of `main()`, after all writes.
+Catch `RuntimeError` in `main()` alongside the other lpass exceptions.
 
 ### Ansible pattern
 
@@ -83,9 +72,10 @@ Use a task (not a handler — this is a post-condition check, not a change respo
         from lpass_wrap import LpassClient
         import sys
         c = LpassClient("tod@tod.net")
-        f, p = c.failed_sync_count(), c.pending_sync_count()
-        if f or p:
-            sys.exit(f"LastPass sync incomplete: {f} failed, {p} pending")
+        try:
+            c.assert_sync_clean()
+        except RuntimeError as e:
+            sys.exit(str(e))
   changed_when: false
 ```
 
