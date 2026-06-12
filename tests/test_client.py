@@ -7,6 +7,7 @@ All tests mock subprocess.run so lpass does not need to be installed.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -137,23 +138,28 @@ class TestGetItem:
 class TestCreate:
     """Tests for LpassClient.create."""
 
-    def test_calls_add_then_edit(self) -> None:
-        """create calls lpass add --password then lpass edit --username."""
+    def test_calls_single_edit_with_both_fields(self) -> None:
+        """create uses one lpass edit --non-interactive --sync=now call with username and password in stdin."""
         client = LpassClient("u@example.com")
-        calls: list[list[str]] = []
+        calls: list[tuple[list[str], str]] = []
 
         def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
-            calls.append(cmd)
+            calls.append((cmd, str(kwargs.get("input", ""))))
             return _make_proc(0, stdout=SHOW_JSON)
 
         with patch("subprocess.run", side_effect=mock_run):
             client.create(ITEM_NAME, username="svc", password="s3cr3t")
 
-        assert any("add" in c and "--password" in c for c in calls)
-        assert any("edit" in c and "--username" in c for c in calls)
+        edit_calls = [(cmd, inp) for cmd, inp in calls if "edit" in cmd]
+        assert len(edit_calls) == 1
+        cmd, stdin = edit_calls[0]
+        assert "--non-interactive" in cmd
+        assert "--sync=now" in cmd
+        assert "Username: svc" in stdin
+        assert "Password: s3cr3t" in stdin
 
     def test_raises_on_lpass_failure(self) -> None:
-        """create raises LpassCommandError when lpass add fails."""
+        """create raises LpassCommandError when lpass edit fails."""
         with patch("subprocess.run", return_value=_make_proc(1, stderr="error")):
             with pytest.raises(LpassCommandError):
                 LpassClient("u@example.com").create(ITEM_NAME, "svc", "s3cr3t")
@@ -182,7 +188,7 @@ class TestUpsert:
 class TestPendingSyncCount:
     """Tests for LpassClient.pending_sync_count."""
 
-    def test_returns_count_of_queue_files(self, tmp_path: "pytest.TempPathFactory") -> None:
+    def test_returns_count_of_queue_files(self, tmp_path: Path) -> None:
         """pending_sync_count returns the number of files in the upload-queue."""
         queue = tmp_path / "upload-queue"
         queue.mkdir()
@@ -191,13 +197,13 @@ class TestPendingSyncCount:
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").pending_sync_count() == 2
 
-    def test_returns_zero_for_empty_queue(self, tmp_path: "pytest.TempPathFactory") -> None:
+    def test_returns_zero_for_empty_queue(self, tmp_path: Path) -> None:
         """pending_sync_count returns 0 when the queue directory is empty."""
         (tmp_path / "upload-queue").mkdir()
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").pending_sync_count() == 0
 
-    def test_returns_zero_when_queue_dir_missing(self, tmp_path: "pytest.TempPathFactory") -> None:
+    def test_returns_zero_when_queue_dir_missing(self, tmp_path: Path) -> None:
         """pending_sync_count returns 0 when upload-queue doesn't exist yet."""
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").pending_sync_count() == 0
@@ -206,7 +212,7 @@ class TestPendingSyncCount:
 class TestFailedSyncCount:
     """Tests for LpassClient.failed_sync_count."""
 
-    def test_returns_count_of_failed_files(self, tmp_path: "pytest.TempPathFactory") -> None:
+    def test_returns_count_of_failed_files(self, tmp_path: Path) -> None:
         """failed_sync_count returns the number of files in the upload-fail directory."""
         fail_dir = tmp_path / "upload-fail"
         fail_dir.mkdir()
@@ -216,13 +222,13 @@ class TestFailedSyncCount:
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").failed_sync_count() == 3
 
-    def test_returns_zero_for_empty_fail_dir(self, tmp_path: "pytest.TempPathFactory") -> None:
+    def test_returns_zero_for_empty_fail_dir(self, tmp_path: Path) -> None:
         """failed_sync_count returns 0 when the upload-fail directory is empty."""
         (tmp_path / "upload-fail").mkdir()
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").failed_sync_count() == 0
 
-    def test_returns_zero_when_fail_dir_missing(self, tmp_path: "pytest.TempPathFactory") -> None:
+    def test_returns_zero_when_fail_dir_missing(self, tmp_path: Path) -> None:
         """failed_sync_count returns 0 when upload-fail doesn't exist."""
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").failed_sync_count() == 0

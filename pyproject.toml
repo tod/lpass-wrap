@@ -63,6 +63,8 @@ select = [
 include = ["lpass_wrap", "tests"]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
 
 [tool.mypy]
 python_version = "3.10"
