@@ -21,7 +21,7 @@ pip install lpass-wrap
 Or install from source in editable mode for development:
 
 ```bash
-git clone https://github.com/tod-detre/lpass-wrap
+git clone https://github.com/tod/lpass-wrap
 cd lpass-wrap
 pip install -e ".[dev]"
 ```
