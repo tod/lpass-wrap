@@ -96,10 +96,13 @@ All exceptions inherit from `LpassError`.
 
 | Exception | When raised |
 |---|---|
+| `LpassNotInstalledError` | The `lpass` binary is not on `PATH`. |
 | `LpassNotLoggedInError` | Not authenticated and no TTY available for interactive login. |
 | `LpassCommandError` | An `lpass` sub-command exited non-zero. Has `.command`, `.returncode`, `.stderr`. |
 | `LpassItemNotFoundError` | Requested item does not exist. Has `.item_name`. |
+| `LpassMultipleMatchesError` | A name matched more than one item. Has `.item_name`, `.count`. |
 | `LpassParseError` | `lpass show` output could not be parsed. Has `.raw`. |
+| `LpassSyncError` | `assert_sync_clean()` found pending or failed uploads. Has `.pending`, `.failed`. |
 
 ## Logging
 
@@ -107,25 +110,31 @@ lpass-wrap uses [structlog](https://www.structlog.org/).  CLI tools should call
 `setup_logging()` early in `main()`:
 
 ```python
-from lpass_wrap._logging import setup_logging
+from lpass_wrap import setup_logging
 setup_logging(verbose=args.verbose)  # 0=WARNING, 1=INFO, 2+=DEBUG
 ```
 
-Output is human-readable (`ConsoleRenderer`) when writing to a TTY, and JSON
-lines when piped or redirected.
+All log output goes to stderr — human-readable (`ConsoleRenderer`) when stderr
+is a TTY, JSON lines when piped or redirected.
+
+**Warning:** if the consuming application never configures structlog, its
+default renderer prints to **stdout**, which will pollute any data your script
+writes there.  Call `setup_logging()` (or configure structlog yourself) in
+every CLI that prints data to stdout.
 
 ## Development
 
 ```bash
 # Install with dev dependencies
-pip install -e ".[dev]"
+uv sync
 
 # Run tests
-pytest
+uv run pytest
 
 # Lint and type-check
-ruff check lpass_wrap tests
-pyright
+uv run ruff check lpass_wrap tests
+uv run mypy .
+uv run pyright
 ```
 
 ## License

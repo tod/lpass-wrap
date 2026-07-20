@@ -25,7 +25,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from typing import Any
 
 import structlog
 
@@ -33,13 +33,12 @@ from .exceptions import (
     LpassCommandError,
     LpassItemNotFoundError,
     LpassMultipleMatchesError,
+    LpassNotInstalledError,
     LpassNotLoggedInError,
     LpassParseError,
+    LpassSyncError,
 )
 from .models import LpassItem
-
-if TYPE_CHECKING:
-    pass
 
 log = structlog.get_logger(__name__)
 
@@ -47,6 +46,25 @@ log = structlog.get_logger(__name__)
 # (lastpass-cli show.c); matched case-insensitively to distinguish a genuine
 # missing item from other failures (network, expired session, ...).
 _NOT_FOUND_MARKER = "could not find"
+
+
+def _run_lpass(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    """Run an lpass command, translating a missing binary into a library error.
+
+    Args:
+        cmd:      The full command list (including 'lpass' as the first element).
+        **kwargs: Passed through to :func:`subprocess.run`.
+
+    Returns:
+        The completed process object.
+
+    Raises:
+        LpassNotInstalledError: If the lpass binary is not on PATH.
+    """
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except FileNotFoundError as exc:
+        raise LpassNotInstalledError() from exc
 
 
 def _lpass_data_dir() -> str:
@@ -116,7 +134,7 @@ class LpassClient:
         Returns:
             True if ``lpass status`` exits 0, False otherwise.
         """
-        result = subprocess.run(["lpass", "status"], capture_output=True)
+        result = _run_lpass(["lpass", "status"], capture_output=True)
         return result.returncode == 0
 
     def login(self) -> None:
@@ -129,7 +147,7 @@ class LpassClient:
             LpassCommandError: If ``lpass login`` exits with a non-zero status.
         """
         self._log.info("lpass_login_prompted")
-        result = subprocess.run(["lpass", "login", self._username])
+        result = _run_lpass(["lpass", "login", self._username])
         if result.returncode != 0:
             raise LpassCommandError("login", result.returncode, "")
 
@@ -145,9 +163,7 @@ class LpassClient:
         if self.is_logged_in():
             return
         if not sys.stdin.isatty() or not self._auto_login:
-            raise LpassNotLoggedInError(
-                "Not logged in to LastPass.  Run 'lpass login' and try again."
-            )
+            raise LpassNotLoggedInError("Not logged in to LastPass.  Run 'lpass login' and try again.")
         self.login()
 
     # ── Sync diagnostics ───────────────────────────────────────────────────
@@ -204,20 +220,24 @@ class LpassClient:
         to LastPass to confirm the background sync process completed.
 
         Raises:
-            RuntimeError: If there are permanently failed items (checked
+            LpassSyncError: If there are permanently failed items (checked
                 first — more severe) or items still pending upload.
         """
         failed = self.failed_sync_count()
         pending = self.pending_sync_count()
         if failed:
-            raise RuntimeError(
+            raise LpassSyncError(
                 f"{failed} LastPass item(s) permanently failed to sync; "
-                "check $LPASS_HOME/upload-fail/ and re-run manually."
+                "check $LPASS_HOME/upload-fail/ and re-run manually.",
+                pending=pending,
+                failed=failed,
             )
         if pending:
-            raise RuntimeError(
+            raise LpassSyncError(
                 f"{pending} LastPass item(s) still pending upload — "
-                "sync may be incomplete. Re-run or check network connectivity."
+                "sync may be incomplete. Re-run or check network connectivity.",
+                pending=pending,
+                failed=failed,
             )
 
     # ── Item queries ───────────────────────────────────────────────────────
@@ -225,8 +245,11 @@ class LpassClient:
     def item_exists(self, item_name: str) -> bool:
         """Return True if a LastPass item with the given name exists.
 
-        Uses ``--sync=no`` for speed; the local cache is up-to-date after
-        any write operation that uses ``--sync=now``.
+        Uses ``--sync=no`` for speed: only the local blob is consulted, so the
+        answer can be stale.  In particular, an item whose write is still in
+        the upload-queue may report False here.  Use :meth:`get_item` (which
+        forces ``--sync=now``) when the answer must be authoritative — see
+        :meth:`upsert` for why.
 
         Args:
             item_name: The LastPass item name or folder path.
@@ -234,7 +257,7 @@ class LpassClient:
         Returns:
             True if found, False otherwise.
         """
-        result = subprocess.run(
+        result = _run_lpass(
             ["lpass", "show", "--sync=no", item_name],
             capture_output=True,
         )
@@ -261,7 +284,7 @@ class LpassClient:
             LpassCommandError:           If lpass fails for any other reason
                                          (network, expired session, ...).
         """
-        result = subprocess.run(
+        result = _run_lpass(
             ["lpass", "show", "--sync=now", "--json", "--expand-multi", item_name],
             capture_output=True,
             text=True,
@@ -298,7 +321,7 @@ class LpassClient:
             LpassItemNotFoundError: If no item with that name exists.
             LpassCommandError:      If lpass exits non-zero for another reason.
         """
-        result = subprocess.run(
+        result: subprocess.CompletedProcess[str] = _run_lpass(
             ["lpass", "show", "--sync=no", flag, item_name],
             capture_output=True,
             text=True,
@@ -484,9 +507,10 @@ class LpassClient:
             The completed process object.
 
         Raises:
-            LpassCommandError: If the process exits with a non-zero status.
+            LpassCommandError:      If the process exits with a non-zero status.
+            LpassNotInstalledError: If the lpass binary is not on PATH.
         """
-        result = subprocess.run(cmd, input=stdin, text=True, capture_output=True)
+        result = _run_lpass(cmd, input=stdin, text=True, capture_output=True)
         if result.returncode != 0:
             subcommand = cmd[1] if len(cmd) > 1 else "unknown"
             raise LpassCommandError(subcommand, result.returncode, result.stderr)
@@ -495,15 +519,18 @@ class LpassClient:
     def _item_from_json(self, data: dict[str, str], item_name: str) -> LpassItem:
         """Build an :class:`LpassItem` from a single ``lpass show --json`` entry.
 
+        Prefers the ``fullname`` reported by lpass over the query string, so
+        the item's real path is returned even when the query was a numeric ID.
+
         Args:
             data:      One element from the JSON array returned by ``lpass show --json``.
-            item_name: The query name (used as the ``name`` field fallback).
+            item_name: The query name (fallback if lpass omits ``fullname``).
 
         Returns:
             A populated :class:`~lpass_wrap.models.LpassItem`.
         """
         return LpassItem(
-            name=item_name,
+            name=data.get("fullname") or item_name,
             item_id=data.get("id", ""),
             username=data.get("username", ""),
             password=data.get("password", ""),

@@ -8,6 +8,46 @@ class LpassError(Exception):
     """Base class for all lpass-wrap exceptions."""
 
 
+class LpassNotInstalledError(LpassError):
+    """Raised when the lpass CLI binary cannot be found on PATH.
+
+    Catch this to tell the user to install lastpass-cli (e.g.
+    ``apt install lastpass-cli`` or ``brew install lastpass-cli``).
+    """
+
+    def __init__(self) -> None:
+        """Initialise with a fixed install-hint message."""
+        super().__init__(
+            "lpass CLI not found on PATH. Install lastpass-cli "
+            "(e.g. 'apt install lastpass-cli' or 'brew install lastpass-cli')."
+        )
+
+
+class LpassSyncError(LpassError):
+    """Raised when local writes have not reached the LastPass server.
+
+    Covers both items still pending in the upload-queue and items that
+    permanently failed after retries (moved to ``upload-fail/``).  See
+    :meth:`~lpass_wrap.client.LpassClient.assert_sync_clean`.
+
+    Attributes:
+        pending: Number of items still waiting in the upload-queue.
+        failed:  Number of items that permanently failed to upload.
+    """
+
+    def __init__(self, message: str, pending: int, failed: int) -> None:
+        """Initialise with the sync-state counts.
+
+        Args:
+            message: Human-readable description of the sync problem.
+            pending: Number of items still waiting in the upload-queue.
+            failed:  Number of items that permanently failed to upload.
+        """
+        self.pending = pending
+        self.failed = failed
+        super().__init__(message)
+
+
 class LpassNotLoggedInError(LpassError):
     """Raised when lpass is not authenticated with LastPass.
 

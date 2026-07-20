@@ -29,7 +29,8 @@ def setup_logging(verbose: int = 0) -> None:
     * 1 — INFO and above  (``-v``)
     * 2+ — DEBUG and above (``-vv`` or more)
 
-    When stdout is a TTY the output uses ``ConsoleRenderer`` with local
+    All log output goes to **stderr**, keeping stdout free for data.  When
+    stderr is a TTY the output uses ``ConsoleRenderer`` with local
     timestamps; otherwise JSON lines are emitted for log aggregation.
 
     Args:
