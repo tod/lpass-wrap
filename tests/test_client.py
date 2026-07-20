@@ -16,9 +16,12 @@ from lpass_wrap import LpassClient, LpassItem
 from lpass_wrap.client import _lpass_data_dir
 from lpass_wrap.exceptions import (
     LpassCommandError,
+    LpassError,
     LpassItemNotFoundError,
     LpassMultipleMatchesError,
+    LpassNotInstalledError,
     LpassNotLoggedInError,
+    LpassSyncError,
 )
 
 ITEM_NAME = "Homelab/Test Secret"
@@ -27,31 +30,51 @@ ITEM_NAME = "Homelab/Test Secret"
 NOT_FOUND_STDERR = "Error: Could not find specified account(s)."
 NETWORK_STDERR = "Error: Peer certificate cannot be authenticated with given CA certificates."
 
-SHOW_JSON = json.dumps([{
-    "id": "9876543210",
-    "name": "Test Secret",
-    "fullname": ITEM_NAME,
-    "username": "svc",
-    "password": "s3cr3t",
-    "url": "",
-    "note": "",
-    "group": "Homelab",
-    "last_modified_gmt": "",
-    "last_touch": "",
-}])
+SHOW_JSON = json.dumps(
+    [
+        {
+            "id": "9876543210",
+            "name": "Test Secret",
+            "fullname": ITEM_NAME,
+            "username": "svc",
+            "password": "s3cr3t",
+            "url": "",
+            "note": "",
+            "group": "Homelab",
+            "last_modified_gmt": "",
+            "last_touch": "",
+        }
+    ]
+)
 
-SHOW_JSON_MULTI = json.dumps([
-    {
-        "id": "111", "name": "Test Secret", "fullname": ITEM_NAME,
-        "username": "svc", "password": "s3cr3t", "url": "", "note": "",
-        "group": "Homelab", "last_modified_gmt": "", "last_touch": "",
-    },
-    {
-        "id": "222", "name": "Test Secret", "fullname": ITEM_NAME,
-        "username": "svc2", "password": "other", "url": "", "note": "",
-        "group": "Homelab", "last_modified_gmt": "", "last_touch": "",
-    },
-])
+SHOW_JSON_MULTI = json.dumps(
+    [
+        {
+            "id": "111",
+            "name": "Test Secret",
+            "fullname": ITEM_NAME,
+            "username": "svc",
+            "password": "s3cr3t",
+            "url": "",
+            "note": "",
+            "group": "Homelab",
+            "last_modified_gmt": "",
+            "last_touch": "",
+        },
+        {
+            "id": "222",
+            "name": "Test Secret",
+            "fullname": ITEM_NAME,
+            "username": "svc2",
+            "password": "other",
+            "url": "",
+            "note": "",
+            "group": "Homelab",
+            "last_modified_gmt": "",
+            "last_touch": "",
+        },
+    ]
+)
 
 
 def _make_proc(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
@@ -355,3 +378,72 @@ class TestFailedSyncCount:
         """failed_sync_count returns 0 when upload-fail doesn't exist."""
         with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
             assert LpassClient("u@example.com").failed_sync_count() == 0
+
+
+class TestAssertSyncClean:
+    """Tests for LpassClient.assert_sync_clean."""
+
+    def test_passes_when_both_dirs_empty(self, tmp_path: Path) -> None:
+        """assert_sync_clean returns silently when nothing is queued or failed."""
+        with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
+            LpassClient("u@example.com").assert_sync_clean()
+
+    def test_raises_sync_error_for_pending_items(self, tmp_path: Path) -> None:
+        """Pending upload-queue items raise LpassSyncError with the counts attached."""
+        queue_dir = tmp_path / "upload-queue"
+        queue_dir.mkdir()
+        (queue_dir / "17808799730000").write_bytes(b"x" * 96)
+        with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
+            with pytest.raises(LpassSyncError) as excinfo:
+                LpassClient("u@example.com").assert_sync_clean()
+        assert excinfo.value.pending == 1
+        assert excinfo.value.failed == 0
+
+    def test_raises_sync_error_for_failed_items_first(self, tmp_path: Path) -> None:
+        """Failed items take precedence in the message even when items are also pending."""
+        for sub in ("upload-queue", "upload-fail"):
+            d = tmp_path / sub
+            d.mkdir()
+            (d / "17808799730000").write_bytes(b"x" * 96)
+        with patch.dict("os.environ", {"LPASS_HOME": str(tmp_path)}):
+            with pytest.raises(LpassSyncError, match="permanently failed") as excinfo:
+                LpassClient("u@example.com").assert_sync_clean()
+        assert excinfo.value.pending == 1
+        assert excinfo.value.failed == 1
+
+    def test_sync_error_is_an_lpass_error(self) -> None:
+        """LpassSyncError participates in the LpassError hierarchy."""
+        assert issubclass(LpassSyncError, LpassError)
+
+
+class TestLpassNotInstalled:
+    """Tests for the missing-binary translation in _run_lpass."""
+
+    def test_missing_binary_raises_not_installed(self) -> None:
+        """A FileNotFoundError from subprocess.run becomes LpassNotInstalledError."""
+        with patch("subprocess.run", side_effect=FileNotFoundError("lpass")):
+            with pytest.raises(LpassNotInstalledError, match="lastpass-cli"):
+                LpassClient("u@example.com").is_logged_in()
+
+    def test_missing_binary_on_write_path(self) -> None:
+        """The stdin write path raises LpassNotInstalledError too."""
+        with patch("subprocess.run", side_effect=FileNotFoundError("lpass")):
+            with pytest.raises(LpassNotInstalledError):
+                LpassClient("u@example.com").create(ITEM_NAME, "svc", "pw")
+
+
+class TestItemFromJsonFullname:
+    """Tests for the fullname preference in _item_from_json."""
+
+    def test_fullname_wins_over_query_string(self) -> None:
+        """When querying by numeric ID, the item's real path is returned as name."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=SHOW_JSON)):
+            item = LpassClient("u@example.com").get_item("9876543210")
+        assert item.name == ITEM_NAME
+
+    def test_query_name_used_when_fullname_absent(self) -> None:
+        """The query string is the fallback when lpass omits fullname."""
+        payload = json.dumps([{"id": "1", "username": "u", "password": "p"}])
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=payload)):
+            item = LpassClient("u@example.com").get_item(ITEM_NAME)
+        assert item.name == ITEM_NAME
