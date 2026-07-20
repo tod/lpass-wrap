@@ -43,6 +43,37 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+# lpass emits "Error: Could not find specified account(s)." for missing items
+# (lastpass-cli show.c); matched case-insensitively to distinguish a genuine
+# missing item from other failures (network, expired session, ...).
+_NOT_FOUND_MARKER = "could not find"
+
+
+def _lpass_data_dir() -> str:
+    """Resolve the directory where the lpass CLI keeps its data files.
+
+    Replicates lastpass-cli's ``config_path_for_type()`` for CONFIG_DATA
+    paths (which covers ``upload-queue/``, ``upload-fail/``, and ``blob``):
+
+    1. ``$LPASS_HOME`` if set.
+    2. ``$XDG_DATA_HOME/lpass`` if ``$XDG_DATA_HOME`` is set.
+    3. ``~/.local/share/lpass`` if ``$XDG_RUNTIME_DIR`` is set (the CLI
+       treats its presence as "this system uses XDG directories").
+    4. ``~/.lpass`` otherwise (legacy fallback).
+
+    Returns:
+        Absolute path of the lpass data directory.
+    """
+    lpass_home = os.environ.get("LPASS_HOME")
+    if lpass_home:
+        return lpass_home
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    if xdg_data:
+        return os.path.join(xdg_data, "lpass")
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        return os.path.join(os.path.expanduser("~"), ".local", "share", "lpass")
+    return os.path.expanduser("~/.lpass")
+
 
 class LpassClient:
     """Client for interacting with the LastPass CLI (lpass).
@@ -129,14 +160,14 @@ class LpassClient:
         non-zero count means previous writes may not be visible to other
         clients and is the likely cause of duplicate-item symptoms.
 
-        The directory is resolved from ``$LPASS_HOME`` (defaulting to
-        ``~/.lpass``), matching how the lpass CLI itself locates it.
+        The directory is resolved exactly as the lpass CLI resolves its data
+        directory (``$LPASS_HOME``, then XDG paths, then ``~/.lpass``); see
+        :func:`_lpass_data_dir`.
 
         Returns:
             Count of pending items (0 if the queue is empty or doesn't exist).
         """
-        lpass_home = os.environ.get("LPASS_HOME", os.path.expanduser("~/.lpass"))
-        queue_dir = os.path.join(lpass_home, "upload-queue")
+        queue_dir = os.path.join(_lpass_data_dir(), "upload-queue")
         try:
             return len(os.listdir(queue_dir))
         except FileNotFoundError:
@@ -151,15 +182,15 @@ class LpassClient:
         count means writes have been permanently lost from the LastPass servers
         and manual intervention is required.
 
-        The directory is resolved from ``$LPASS_HOME`` (defaulting to
-        ``~/.lpass``), matching how the lpass CLI itself locates it.
+        The directory is resolved exactly as the lpass CLI resolves its data
+        directory (``$LPASS_HOME``, then XDG paths, then ``~/.lpass``); see
+        :func:`_lpass_data_dir`.
 
         Returns:
             Count of permanently failed items (0 if the directory is empty or
             doesn't exist).
         """
-        lpass_home = os.environ.get("LPASS_HOME", os.path.expanduser("~/.lpass"))
-        fail_dir = os.path.join(lpass_home, "upload-fail")
+        fail_dir = os.path.join(_lpass_data_dir(), "upload-fail")
         try:
             return len(os.listdir(fail_dir))
         except FileNotFoundError:
@@ -227,6 +258,8 @@ class LpassClient:
             LpassItemNotFoundError:      If no item with that name exists.
             LpassMultipleMatchesError:   If more than one item shares that name.
             LpassParseError:             If the lpass JSON output cannot be parsed.
+            LpassCommandError:           If lpass fails for any other reason
+                                         (network, expired session, ...).
         """
         result = subprocess.run(
             ["lpass", "show", "--sync=now", "--json", "--expand-multi", item_name],
@@ -234,7 +267,10 @@ class LpassClient:
             text=True,
         )
         if result.returncode != 0:
-            raise LpassItemNotFoundError(item_name)
+            stderr = result.stderr.strip()
+            if _NOT_FOUND_MARKER in stderr.lower():
+                raise LpassItemNotFoundError(item_name)
+            raise LpassCommandError("show", result.returncode, stderr)
 
         try:
             items = json.loads(result.stdout)
@@ -269,7 +305,7 @@ class LpassClient:
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()
-            if "not found" in stderr.lower():
+            if _NOT_FOUND_MARKER in stderr.lower():
                 raise LpassItemNotFoundError(item_name)
             raise LpassCommandError("show", result.returncode, stderr)
         return result.stdout.strip()
@@ -331,22 +367,19 @@ class LpassClient:
 
         Args:
             item_name: The LastPass item name or folder path.
-            username:  Value for the Username field.
+            username:  Value for the Username field.  An empty string omits
+                       the field entirely.
             password:  Value for the Password field.
 
         Returns:
             The newly created item fetched from LastPass.
 
         Raises:
+            ValueError:        If username or password contains a newline.
             LpassCommandError: If the lpass command fails.
         """
         self._log.info("lpass_create", item=item_name)
-        fields = f"Username: {username}\nPassword: {password}\n" if username else f"Password: {password}\n"
-        self._run_with_stdin(
-            ["lpass", "edit", "--non-interactive", "--sync=now", item_name],
-            stdin=fields,
-        )
-        return self.get_item(item_name)
+        return self._edit_fields(item_name, username, password)
 
     def update(self, item_name: str, username: str, password: str) -> LpassItem:
         """Update the username and password of an existing LastPass login item.
@@ -362,22 +395,20 @@ class LpassClient:
 
         Args:
             item_name: The LastPass item name or folder path.
-            username:  New value for the Username field.
+            username:  New value for the Username field.  An empty string
+                       leaves the existing Username unchanged (the field is
+                       omitted from the edit) — it does NOT clear it.
             password:  New value for the Password field.
 
         Returns:
             The updated item fetched from LastPass.
 
         Raises:
+            ValueError:        If username or password contains a newline.
             LpassCommandError: If the lpass command fails.
         """
         self._log.info("lpass_update", item=item_name)
-        fields = f"Username: {username}\nPassword: {password}\n" if username else f"Password: {password}\n"
-        self._run_with_stdin(
-            ["lpass", "edit", "--non-interactive", "--sync=now", item_name],
-            stdin=fields,
-        )
-        return self.get_item(item_name)
+        return self._edit_fields(item_name, username, password)
 
     def upsert(self, item_name: str, username: str, password: str) -> LpassItem:
         """Create or update a LastPass login item.
@@ -405,6 +436,43 @@ class LpassClient:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
+    def _edit_fields(self, item_name: str, username: str, password: str) -> LpassItem:
+        """Write Username/Password with one lpass edit call and re-fetch the item.
+
+        Uses ``lpass edit --non-interactive --sync=now``, which creates the
+        item if it does not exist.  Both fields are provided together via
+        stdin as ``Field: value`` lines so neither value ever appears in a
+        process argument list and only one upload occurs.  An empty username
+        omits the Username line entirely.
+
+        Args:
+            item_name: The LastPass item name or folder path.
+            username:  Value for the Username field ('' to omit the field).
+            password:  Value for the Password field.
+
+        Returns:
+            The item fetched from LastPass after the write.
+
+        Raises:
+            ValueError:        If username or password contains a newline —
+                               the ``Field: value`` stdin format cannot
+                               represent multi-line values, and interpolating
+                               them would corrupt the record.
+            LpassCommandError: If the lpass command fails.
+        """
+        for label, value in (("username", username), ("password", password)):
+            if "\n" in value or "\r" in value:
+                raise ValueError(
+                    f"{label} must not contain newline characters: "
+                    "the lpass 'Field: value' input format cannot represent them"
+                )
+        fields = f"Username: {username}\nPassword: {password}\n" if username else f"Password: {password}\n"
+        self._run_with_stdin(
+            ["lpass", "edit", "--non-interactive", "--sync=now", item_name],
+            stdin=fields,
+        )
+        return self.get_item(item_name)
+
     def _run_with_stdin(self, cmd: list[str], stdin: str) -> subprocess.CompletedProcess[str]:
         """Run an lpass command with a value piped to stdin.
 
@@ -424,7 +492,7 @@ class LpassClient:
             raise LpassCommandError(subcommand, result.returncode, result.stderr)
         return result
 
-    def _item_from_json(self, data: dict, item_name: str) -> LpassItem:
+    def _item_from_json(self, data: dict[str, str], item_name: str) -> LpassItem:
         """Build an :class:`LpassItem` from a single ``lpass show --json`` entry.
 
         Args:

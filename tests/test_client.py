@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lpass_wrap import LpassClient, LpassItem
+from lpass_wrap.client import _lpass_data_dir
 from lpass_wrap.exceptions import (
     LpassCommandError,
     LpassItemNotFoundError,
@@ -21,6 +22,10 @@ from lpass_wrap.exceptions import (
 )
 
 ITEM_NAME = "Homelab/Test Secret"
+
+# Verbatim lpass CLI messages (lastpass-cli show.c / http errors).
+NOT_FOUND_STDERR = "Error: Could not find specified account(s)."
+NETWORK_STDERR = "Error: Peer certificate cannot be authenticated with given CA certificates."
 
 SHOW_JSON = json.dumps([{
     "id": "9876543210",
@@ -121,9 +126,15 @@ class TestGetItem:
         assert item.password == "s3cr3t"
 
     def test_raises_when_not_found(self) -> None:
-        """get_item raises LpassItemNotFoundError when lpass show exits non-zero."""
-        with patch("subprocess.run", return_value=_make_proc(1)):
+        """get_item raises LpassItemNotFoundError on the CLI's 'could not find' message."""
+        with patch("subprocess.run", return_value=_make_proc(1, stderr=NOT_FOUND_STDERR)):
             with pytest.raises(LpassItemNotFoundError):
+                LpassClient("u@example.com").get_item(ITEM_NAME)
+
+    def test_raises_command_error_on_other_failure(self) -> None:
+        """get_item raises LpassCommandError (not NotFound) when lpass fails for another reason."""
+        with patch("subprocess.run", return_value=_make_proc(1, stderr=NETWORK_STDERR)):
+            with pytest.raises(LpassCommandError):
                 LpassClient("u@example.com").get_item(ITEM_NAME)
 
     def test_raises_when_multiple_matches(self) -> None:
@@ -133,6 +144,55 @@ class TestGetItem:
                 LpassClient("u@example.com").get_item(ITEM_NAME)
         assert exc_info.value.count == 2
         assert exc_info.value.item_name == ITEM_NAME
+
+
+class TestGetField:
+    """Tests for LpassClient.get_field."""
+
+    def test_returns_stripped_value(self) -> None:
+        """get_field returns the field value with surrounding whitespace stripped."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")):
+            assert LpassClient("u@example.com").get_field(ITEM_NAME, "--password") == "s3cr3t"
+
+    def test_raises_not_found_on_could_not_find_stderr(self) -> None:
+        """get_field maps the CLI's 'could not find' message to LpassItemNotFoundError."""
+        with patch("subprocess.run", return_value=_make_proc(1, stderr=NOT_FOUND_STDERR)):
+            with pytest.raises(LpassItemNotFoundError):
+                LpassClient("u@example.com").get_field(ITEM_NAME, "--password")
+
+    def test_raises_command_error_on_other_failure(self) -> None:
+        """get_field raises LpassCommandError when lpass fails for another reason."""
+        with patch("subprocess.run", return_value=_make_proc(1, stderr=NETWORK_STDERR)):
+            with pytest.raises(LpassCommandError):
+                LpassClient("u@example.com").get_field(ITEM_NAME, "--password")
+
+
+class TestLpassDataDir:
+    """Tests for the _lpass_data_dir resolution chain (mirrors lastpass-cli config.c)."""
+
+    def test_lpass_home_wins(self, tmp_path: Path) -> None:
+        """$LPASS_HOME takes precedence over everything else."""
+        env = {"LPASS_HOME": str(tmp_path), "XDG_DATA_HOME": "/xdg/data", "HOME": "/home/u"}
+        with patch.dict("os.environ", env, clear=True):
+            assert _lpass_data_dir() == str(tmp_path)
+
+    def test_xdg_data_home_wins_without_runtime_dir(self) -> None:
+        """$XDG_DATA_HOME is honoured even when $XDG_RUNTIME_DIR is unset."""
+        env = {"XDG_DATA_HOME": "/xdg/data", "HOME": "/home/u"}
+        with patch.dict("os.environ", env, clear=True):
+            assert _lpass_data_dir() == "/xdg/data/lpass"
+
+    def test_runtime_dir_implies_local_share_default(self) -> None:
+        """$XDG_RUNTIME_DIR set without $XDG_DATA_HOME resolves to ~/.local/share/lpass."""
+        env = {"XDG_RUNTIME_DIR": "/run/user/1000", "HOME": "/home/u"}
+        with patch.dict("os.environ", env, clear=True):
+            assert _lpass_data_dir() == "/home/u/.local/share/lpass"
+
+    def test_legacy_fallback_without_any_xdg(self) -> None:
+        """With no LPASS_HOME and no XDG variables, falls back to ~/.lpass."""
+        env = {"HOME": "/home/u"}
+        with patch.dict("os.environ", env, clear=True):
+            assert _lpass_data_dir() == "/home/u/.lpass"
 
 
 class TestCreate:
@@ -164,6 +224,54 @@ class TestCreate:
             with pytest.raises(LpassCommandError):
                 LpassClient("u@example.com").create(ITEM_NAME, "svc", "s3cr3t")
 
+    @pytest.mark.parametrize("field", ["username", "password"])
+    def test_rejects_newlines_in_values(self, field: str) -> None:
+        """create raises ValueError before running lpass when a value contains a newline."""
+        kwargs = {"username": "svc", "password": "s3cr3t", field: "evil\nNotes: injected"}
+        with patch("subprocess.run") as mock_run:
+            with pytest.raises(ValueError, match="newline"):
+                LpassClient("u@example.com").create(ITEM_NAME, **kwargs)
+        mock_run.assert_not_called()
+
+
+class TestUpdate:
+    """Tests for LpassClient.update."""
+
+    def test_calls_single_edit_with_both_fields(self) -> None:
+        """update issues one lpass edit call with both fields in stdin, like create."""
+        client = LpassClient("u@example.com")
+        calls: list[tuple[list[str], str]] = []
+
+        def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            calls.append((cmd, str(kwargs.get("input", ""))))
+            return _make_proc(0, stdout=SHOW_JSON)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.update(ITEM_NAME, username="svc", password="newpass")
+
+        edit_calls = [(cmd, inp) for cmd, inp in calls if "edit" in cmd]
+        assert len(edit_calls) == 1
+        cmd, stdin = edit_calls[0]
+        assert "--non-interactive" in cmd
+        assert "--sync=now" in cmd
+        assert "Username: svc" in stdin
+        assert "Password: newpass" in stdin
+
+    def test_empty_username_omits_field(self) -> None:
+        """update with an empty username sends only the Password line (leaves Username unchanged)."""
+        client = LpassClient("u@example.com")
+        stdins: list[str] = []
+
+        def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            if "edit" in cmd:
+                stdins.append(str(kwargs.get("input", "")))
+            return _make_proc(0, stdout=SHOW_JSON)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.update(ITEM_NAME, username="", password="newpass")
+
+        assert stdins == ["Password: newpass\n"]
+
 
 class TestUpsert:
     """Tests for LpassClient.upsert."""
@@ -183,6 +291,21 @@ class TestUpsert:
             with patch.object(client, "update", return_value=MagicMock()) as mock_update:
                 client.upsert(ITEM_NAME, "svc", "newpass")
                 mock_update.assert_called_once_with(ITEM_NAME, "svc", "newpass")
+
+    def test_propagates_command_error_without_creating(self) -> None:
+        """upsert must NOT create when the existence check fails for a non-'not found' reason.
+
+        Regression guard for the duplicate-entry bug: a network/session failure
+        during get_item used to be misread as 'item missing', triggering create
+        and queueing a duplicate write.
+        """
+        client = LpassClient("u@example.com")
+        err = LpassCommandError("show", 1, NETWORK_STDERR)
+        with patch.object(client, "get_item", side_effect=err):
+            with patch.object(client, "create") as mock_create:
+                with pytest.raises(LpassCommandError):
+                    client.upsert(ITEM_NAME, "svc", "s3cr3t")
+        mock_create.assert_not_called()
 
 
 class TestPendingSyncCount:
