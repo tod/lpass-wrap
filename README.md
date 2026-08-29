@@ -140,4 +140,4 @@ uv run pyright
 ## License
 
 Copyright 2026 Tod Detre.
-Released under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html).
+Released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
