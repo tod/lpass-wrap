@@ -139,3 +139,36 @@ class LpassParseError(LpassError):
         """
         self.raw = raw
         super().__init__(f"Could not parse lpass output: {raw!r}")
+
+
+class LpassTimeoutError(LpassError):
+    """Raised when an lpass sub-command exceeds its allotted wall-clock time.
+
+    Commands that force a server sync (``lpass show --sync=now``, every write)
+    block on the network.  Without a timeout a stalled connection hangs the
+    caller indefinitely — as an Ansible vault-password script, that hangs the
+    whole playbook with no diagnostic.  See ``LpassClient(timeout=...)``.
+
+    Note:
+        The interactive :meth:`~lpass_wrap.client.LpassClient.login` is
+        deliberately exempt: it waits on a human typing a master password.
+
+    Attributes:
+        command: The lpass sub-command that timed out (e.g. 'show', 'edit').
+        timeout: The timeout in seconds that was exceeded.
+    """
+
+    def __init__(self, command: str, timeout: float) -> None:
+        """Initialise with the timed-out command and its limit.
+
+        Args:
+            command: The lpass sub-command that timed out.
+            timeout: The timeout in seconds that was exceeded.
+        """
+        self.command = command
+        self.timeout = timeout
+        super().__init__(
+            f"lpass {command} timed out after {timeout:g}s. "
+            "The LastPass server may be unreachable; raise LpassClient(timeout=...) "
+            "or pass timeout=None to wait indefinitely."
+        )

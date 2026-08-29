@@ -75,3 +75,19 @@ n = client.pending_sync_count()  # non-zero means writes are stuck
 
 **Secrets always via stdin**
 Never pass passwords or usernames as CLI arguments — they appear in process listings. Always use `_run_with_stdin()`.
+
+**Every command is timed out except `login()`**
+`_run_lpass()` takes explicit keyword params (`capture_output`, `text`, `input`,
+`timeout`) rather than `**kwargs: Any`, and maps `subprocess.TimeoutExpired` to
+`LpassTimeoutError`. The limit comes from `LpassClient(timeout=...)`, 60s by
+default. `login()` is deliberately exempt — it waits on a human typing a master
+password, and it also does not capture output (so lpass can drive the terminal
+prompt), which is why its `LpassCommandError` carries an empty `stderr`.
+
+**Secret fields on the model are `SecretStr`**
+`LpassItem.password` and `.notes` are pydantic `SecretStr`, so a stray
+`print(item)` or structlog bind cannot leak them. Two consequences when editing:
+`_item_from_json()` must wrap the raw JSON values, and `with_password()` must
+wrap a plain `str` itself — `model_copy(update=...)` does **not** re-validate,
+so an unwrapped string would sit in the field and only fail later at the
+`.get_secret_value()` call site.

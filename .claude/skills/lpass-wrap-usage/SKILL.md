@@ -26,8 +26,8 @@ def main() -> None:
 |---|---|
 | `ensure_login()` | Logs in interactively if needed; raises `LpassNotLoggedInError` in non-TTY |
 | `item_exists(name)` | Returns bool; uses `--sync=no` (fast, but stale — avoid for post-write checks) |
-| `get_password(name)` | Returns password field; raises `LpassItemNotFoundError` if missing |
-| `get_username(name)` | Returns username field |
+| `get_password(name, sync=False)` | Returns password field as a plain `str`; raises `LpassItemNotFoundError` if missing. `--sync=no` by default — pass `sync=True` when a stale value would be wrong |
+| `get_username(name, sync=False)` | Returns username field; same caching caveat |
 | `get_item(name)` | Returns `LpassItem`; forces `--sync=now`; raises `LpassMultipleMatchesError` if duplicates exist |
 | `upsert(name, username, password)` | Create or update — uses `get_item()` internally so it is sync-authoritative |
 | `create(name, username, password)` | Explicit create |
@@ -39,7 +39,7 @@ def main() -> None:
 ## Exceptions
 
 ```python
-from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassNotLoggedInError, LpassCommandError, LpassSyncError
+from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassNotLoggedInError, LpassCommandError, LpassSyncError, LpassTimeoutError
 ```
 
 - `LpassItemNotFoundError` — item name doesn't exist; catch this instead of checking `item_exists()` first when you expect the item to be there.
@@ -47,6 +47,33 @@ from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassN
 - `LpassNotLoggedInError` — raised by `ensure_login()` in non-TTY sessions; let it propagate.
 - `LpassCommandError` — underlying `lpass` command failed; has `.returncode` and `.stderr`.
 - `LpassSyncError` — raised by `assert_sync_clean()` when writes have not reached the server. Has `.pending` and `.failed` counts.
+- `LpassTimeoutError` — an `lpass` sub-command exceeded the client timeout (60s default). Has `.command` and `.timeout`. Usually means the LastPass server is unreachable; raise it with `LpassClient(timeout=...)` or disable with `timeout=None`.
+
+## Reading secrets off an `LpassItem`
+
+`LpassItem.password` and `LpassItem.notes` are pydantic `SecretStr`, so they
+redact themselves in reprs, `model_dump_json()`, and structlog binds. Reading
+the plaintext is explicit:
+
+```python
+item = _lpass.get_item("Homelab/My Secret")
+log.info("fetched", item=item)          # safe — password renders as **********
+token = item.password.get_secret_value()  # explicit unwrap
+```
+
+The field getters (`get_password`, `get_username`) return plain `str`, not
+`SecretStr` — they exist to hand you the value, so keeping them out of logs is
+the caller's job.
+
+## Stale reads after a rotation
+
+`get_password()` and `get_username()` read the local cache (`--sync=no`) for
+speed and can return the **old** value after a rotation performed on another
+machine or in the web vault. When verifying a rotation, force a server read:
+
+```python
+assert _lpass.get_password(name, sync=True) == new_value
+```
 
 ## Verifying sync in automation scripts
 

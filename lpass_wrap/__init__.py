@@ -33,6 +33,7 @@ from .exceptions import (
     LpassNotLoggedInError,
     LpassParseError,
     LpassSyncError,
+    LpassTimeoutError,
 )
 from .models import LpassItem
 
@@ -47,5 +48,6 @@ __all__ = [
     "LpassNotLoggedInError",
     "LpassParseError",
     "LpassSyncError",
+    "LpassTimeoutError",
     "setup_logging",
 ]

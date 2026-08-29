@@ -36,17 +36,22 @@ client.ensure_login()   # prompts for master password if not already logged in
 
 # Read an item
 item = client.get_item("Homelab/My Secret")
-print(item.username)   # "admin"
-print(item.password)   # "s3cr3t"
-print(item.item_id)    # "9876543210"
+print(item.username)                       # "admin"
+print(item.password)                       # "**********" — redacted
+print(item.password.get_secret_value())    # "s3cr3t"
+print(item.item_id)                        # "9876543210"
 
 # Create or update
 client.upsert("Homelab/My Secret", username="svc", password="newpass")
 
-# Convenience field accessors
+# Convenience field accessors (plaintext str, not SecretStr)
 password = client.get_password("Homelab/My Secret")
 username = client.get_username("Homelab/My Secret")
 item_id  = client.get_id("Homelab/My Secret")
+
+# These read the local cache by default, so they can be stale after a
+# rotation performed elsewhere.  Force a server read when it must be fresh:
+password = client.get_password("Homelab/My Secret", sync=True)
 
 # Check existence without raising
 if client.item_exists("Homelab/My Secret"):
@@ -58,10 +63,16 @@ if client.item_exists("Homelab/My Secret"):
 ### `LpassClient`
 
 ```python
-LpassClient(username: str, auto_login: bool = True)
+LpassClient(username: str, auto_login: bool = True, timeout: float | None = 60.0)
 ```
 
 The main entry point.  All methods raise subclasses of `LpassError` on failure.
+
+Every sub-command except the interactive `login()` runs under `timeout` seconds
+and raises `LpassTimeoutError` if it overruns — sync-forcing commands block on
+the network, and an unbounded wait hangs the caller (for the bundled Ansible
+vault-password script, that means the whole playbook, with no diagnostic).
+Pass `timeout=None` to wait indefinitely.
 
 | Method | Description |
 |---|---|
@@ -70,8 +81,8 @@ The main entry point.  All methods raise subclasses of `LpassError` on failure.
 | `ensure_login()` | Login if needed; raises `LpassNotLoggedInError` in non-TTY sessions. |
 | `item_exists(name) -> bool` | Return True if the item exists. |
 | `get_item(name) -> LpassItem` | Fetch a full item; raises `LpassItemNotFoundError` if missing. |
-| `get_password(name) -> str` | Fetch only the Password field. |
-| `get_username(name) -> str` | Fetch only the Username field. |
+| `get_password(name, *, sync=False) -> str` | Fetch only the Password field. Cached unless `sync=True`. |
+| `get_username(name, *, sync=False) -> str` | Fetch only the Username field. Cached unless `sync=True`. |
 | `get_id(name) -> str` | Fetch the numeric item ID, or `''` if not found. |
 | `create(name, username, password) -> LpassItem` | Create a new login item. |
 | `update(name, username, password) -> LpassItem` | Update an existing item. |
@@ -85,10 +96,16 @@ Immutable Pydantic model representing a LastPass login item.
 item.name      # str — item path/title
 item.item_id   # str — numeric LastPass ID
 item.username  # str
-item.password  # str
+item.password  # SecretStr — .get_secret_value() for the plaintext
 item.url       # str
-item.notes     # str
+item.notes     # SecretStr — .get_secret_value() for the plaintext
 ```
+
+`password` and `notes` are [`SecretStr`](https://docs.pydantic.dev/latest/api/types/#pydantic.types.SecretStr),
+so they render as `**********` in `repr()`, `str()`, `model_dump()`,
+`model_dump_json()`, and any structlog call that binds the item.  Reading the
+plaintext takes an explicit `.get_secret_value()`, which keeps every such point
+greppable.
 
 ### Exceptions
 
@@ -103,6 +120,7 @@ All exceptions inherit from `LpassError`.
 | `LpassMultipleMatchesError` | A name matched more than one item. Has `.item_name`, `.count`. |
 | `LpassParseError` | `lpass show` output could not be parsed. Has `.raw`. |
 | `LpassSyncError` | `assert_sync_clean()` found pending or failed uploads. Has `.pending`, `.failed`. |
+| `LpassTimeoutError` | An `lpass` sub-command exceeded the client timeout. Has `.command`, `.timeout`. |
 
 ## Logging
 
