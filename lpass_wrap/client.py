@@ -326,7 +326,7 @@ class LpassClient:
             LpassTimeoutError: If lpass exceeds the client timeout.
         """
         result = _run_lpass(
-            ["lpass", "show", "--sync=no", item_name],
+            ["lpass", "show", "--sync=no", "--", item_name],
             capture_output=True,
             timeout=self._timeout,
         )
@@ -355,7 +355,7 @@ class LpassClient:
             LpassTimeoutError:           If lpass exceeds the client timeout.
         """
         result = _run_lpass(
-            ["lpass", "show", "--sync=now", "--json", "--expand-multi", item_name],
+            ["lpass", "show", "--sync=now", "--json", "--expand-multi", "--", item_name],
             capture_output=True,
             text=True,
             timeout=self._timeout,
@@ -398,9 +398,11 @@ class LpassClient:
                        round-trip.
 
         Returns:
-            The field value, stripped of whitespace.  This is **plaintext**:
-            unlike :attr:`LpassItem.password` it is not wrapped in a
-            ``SecretStr``, so the caller owns keeping it out of logs.
+            The field value with only the CLI's trailing newline removed —
+            leading and trailing spaces that are part of the stored value are
+            preserved.  This is **plaintext**: unlike :attr:`LpassItem.password`
+            it is not wrapped in a ``SecretStr``, so the caller owns keeping it
+            out of logs.
 
         Raises:
             LpassItemNotFoundError: If no item with that name exists.
@@ -408,7 +410,7 @@ class LpassClient:
             LpassTimeoutError:      If lpass exceeds the client timeout.
         """
         result: subprocess.CompletedProcess[str] = _run_lpass(
-            ["lpass", "show", "--sync=now" if sync else "--sync=no", flag, item_name],
+            ["lpass", "show", "--sync=now" if sync else "--sync=no", flag, "--", item_name],
             capture_output=True,
             text=True,
             timeout=self._timeout,
@@ -418,7 +420,9 @@ class LpassClient:
             if _NOT_FOUND_MARKER in stderr.lower():
                 raise LpassItemNotFoundError(item_name)
             raise LpassCommandError("show", result.returncode, stderr)
-        return result.stdout.strip()
+        # rstrip only the line terminator lpass appends; a password may legitimately
+        # begin or end with spaces, and .strip() would silently corrupt it.
+        return result.stdout.rstrip("\r\n")
 
     def get_password(self, item_name: str, *, sync: bool = False) -> str:
         """Return the Password field of a LastPass item.
@@ -489,7 +493,7 @@ class LpassClient:
 
     # ── Item mutations ─────────────────────────────────────────────────────
 
-    def create(self, item_name: str, username: str, password: str) -> LpassItem:
+    def create(self, item_name: str, username: str, password: str | SecretStr) -> LpassItem:
         """Create a new LastPass login item.
 
         Uses a single ``lpass edit --non-interactive --sync=now`` call, which
@@ -501,7 +505,8 @@ class LpassClient:
             item_name: The LastPass item name or folder path.
             username:  Value for the Username field.  An empty string omits
                        the field entirely.
-            password:  Value for the Password field.
+            password:  Value for the Password field.  Accepts a ``str`` or a
+                       pydantic ``SecretStr`` (the latter is unwrapped).
 
         Returns:
             The newly created item fetched from LastPass.
@@ -514,7 +519,7 @@ class LpassClient:
         self._log.info("lpass_create", item=item_name)
         return self._edit_fields(item_name, username, password)
 
-    def update(self, item_name: str, username: str, password: str) -> LpassItem:
+    def update(self, item_name: str, username: str, password: str | SecretStr) -> LpassItem:
         """Update the username and password of an existing LastPass login item.
 
         Uses a single ``lpass edit --non-interactive --sync=now`` call with
@@ -531,7 +536,8 @@ class LpassClient:
             username:  New value for the Username field.  An empty string
                        leaves the existing Username unchanged (the field is
                        omitted from the edit) — it does NOT clear it.
-            password:  New value for the Password field.
+            password:  New value for the Password field.  Accepts a ``str`` or a
+                       pydantic ``SecretStr`` (the latter is unwrapped).
 
         Returns:
             The updated item fetched from LastPass.
@@ -544,7 +550,7 @@ class LpassClient:
         self._log.info("lpass_update", item=item_name)
         return self._edit_fields(item_name, username, password)
 
-    def upsert(self, item_name: str, username: str, password: str) -> LpassItem:
+    def upsert(self, item_name: str, username: str, password: str | SecretStr) -> LpassItem:
         """Create or update a LastPass login item.
 
         Uses :meth:`get_item` (which forces ``--sync=now``) to check existence,
@@ -554,7 +560,8 @@ class LpassClient:
         Args:
             item_name: The LastPass item name or folder path.
             username:  Value for the Username field.
-            password:  Value for the Password field.
+            password:  Value for the Password field.  Accepts a ``str`` or a
+                       pydantic ``SecretStr`` (the latter is unwrapped).
 
         Returns:
             The created or updated item fetched from LastPass.
@@ -571,7 +578,7 @@ class LpassClient:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
-    def _edit_fields(self, item_name: str, username: str, password: str) -> LpassItem:
+    def _edit_fields(self, item_name: str, username: str, password: str | SecretStr) -> LpassItem:
         """Write Username/Password with one lpass edit call and re-fetch the item.
 
         Uses ``lpass edit --non-interactive --sync=now``, which creates the
@@ -583,7 +590,10 @@ class LpassClient:
         Args:
             item_name: The LastPass item name or folder path.
             username:  Value for the Username field ('' to omit the field).
-            password:  Value for the Password field.
+            password:  Value for the Password field.  A ``SecretStr`` is
+                       unwrapped to its plaintext; a bare ``str`` is used as-is.
+                       Passing a ``SecretStr`` without unwrapping would write
+                       the literal string ``**********`` to LastPass.
 
         Returns:
             The item fetched from LastPass after the write.
@@ -596,6 +606,8 @@ class LpassClient:
             LpassCommandError: If the lpass command fails.
             LpassTimeoutError: If lpass exceeds the client timeout.
         """
+        if isinstance(password, SecretStr):
+            password = password.get_secret_value()
         for label, value in (("username", username), ("password", password)):
             if "\n" in value or "\r" in value:
                 raise ValueError(
@@ -604,7 +616,7 @@ class LpassClient:
                 )
         fields = f"Username: {username}\nPassword: {password}\n" if username else f"Password: {password}\n"
         self._run_with_stdin(
-            ["lpass", "edit", "--non-interactive", "--sync=now", item_name],
+            ["lpass", "edit", "--non-interactive", "--sync=now", "--", item_name],
             stdin=fields,
         )
         return self.get_item(item_name)

@@ -23,6 +23,7 @@ from lpass_wrap.exceptions import (
     LpassMultipleMatchesError,
     LpassNotInstalledError,
     LpassNotLoggedInError,
+    LpassParseError,
     LpassSyncError,
     LpassTimeoutError,
 )
@@ -171,14 +172,45 @@ class TestGetItem:
         assert exc_info.value.count == 2
         assert exc_info.value.item_name == ITEM_NAME
 
+    def test_parse_error_keeps_the_secret_out_of_the_message(self) -> None:
+        """Unparseable --json output holds the plaintext password; it must not
+        land in the exception string, and .raw must be a redacted SecretStr."""
+        leaky = '{"password": "s3cr3t-plaintext" TRUNCATED'
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=leaky)):
+            with pytest.raises(LpassParseError) as exc_info:
+                LpassClient("u@example.com").get_item(ITEM_NAME)
+        assert "s3cr3t-plaintext" not in str(exc_info.value)
+        assert isinstance(exc_info.value.raw, SecretStr)
+        assert exc_info.value.raw.get_secret_value() == leaky
+        assert "s3cr3t-plaintext" not in repr(exc_info.value.raw)
+
+    def test_passes_item_name_positionally_after_a_dash_dash(self) -> None:
+        """An item name starting with '--' must reach lpass as a positional."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=SHOW_JSON)) as mock_run:
+            LpassClient("u@example.com").get_item(ITEM_NAME)
+        cmd = list(mock_run.call_args.args[0])
+        assert cmd[-2:] == ["--", ITEM_NAME]
+
 
 class TestGetField:
     """Tests for LpassClient.get_field."""
 
-    def test_returns_stripped_value(self) -> None:
-        """get_field returns the field value with surrounding whitespace stripped."""
+    def test_strips_only_the_trailing_newline(self) -> None:
+        """get_field removes the CLI's line terminator and nothing else."""
         with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")):
             assert LpassClient("u@example.com").get_field(ITEM_NAME, "--password") == "s3cr3t"
+
+    def test_preserves_leading_and_trailing_spaces_in_the_value(self) -> None:
+        """A password with edge whitespace survives — .strip() would corrupt it."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="  pass phrase \n")):
+            assert LpassClient("u@example.com").get_field(ITEM_NAME, "--password") == "  pass phrase "
+
+    def test_passes_item_name_positionally_after_a_dash_dash(self) -> None:
+        """An item name starting with '--' must not be parsed by lpass as a flag."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")) as mock_run:
+            LpassClient("u@example.com").get_field("--not-a-flag", "--password")
+        cmd = list(mock_run.call_args.args[0])
+        assert cmd[-2:] == ["--", "--not-a-flag"]
 
     def test_raises_not_found_on_could_not_find_stderr(self) -> None:
         """get_field maps the CLI's 'could not find' message to LpassItemNotFoundError."""
@@ -297,6 +329,37 @@ class TestUpdate:
             client.update(ITEM_NAME, username="", password="newpass")
 
         assert stdins == ["Password: newpass\n"]
+
+    def test_unwraps_a_secretstr_password(self) -> None:
+        """Passing item.password (a SecretStr) must write the plaintext, not '**********'."""
+        client = LpassClient("u@example.com")
+        stdins: list[str] = []
+
+        def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            if "edit" in cmd:
+                stdins.append(str(kwargs.get("input", "")))
+            return _make_proc(0, stdout=SHOW_JSON)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.update(ITEM_NAME, username="svc", password=SecretStr("s3cr3t"))
+
+        assert "Password: s3cr3t" in stdins[0]
+        assert "**********" not in stdins[0]
+
+    def test_passes_item_name_positionally_after_a_dash_dash(self) -> None:
+        """lpass edit must receive an item name via a positional, not as a flag."""
+        client = LpassClient("u@example.com")
+        edit_cmds: list[list[str]] = []
+
+        def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            if "edit" in cmd:
+                edit_cmds.append(list(cmd))
+            return _make_proc(0, stdout=SHOW_JSON)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.update(ITEM_NAME, username="svc", password="newpass")
+
+        assert edit_cmds[0][-2:] == ["--", ITEM_NAME]
 
 
 class TestUpsert:

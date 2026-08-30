@@ -3,6 +3,8 @@
 
 """Exceptions raised by lpass-wrap."""
 
+from pydantic import SecretStr
+
 
 class LpassError(Exception):
     """Base class for all lpass-wrap exceptions."""
@@ -127,18 +129,27 @@ class LpassMultipleMatchesError(LpassError):
 class LpassParseError(LpassError):
     """Raised when lpass output cannot be parsed into an expected format.
 
+    The unparseable output is almost always ``lpass show --json``, which
+    contains the item's plaintext password and notes, so it is **not** placed
+    in the exception message (which lands in tracebacks and logs).  It is kept
+    on ``.raw`` as a :class:`~pydantic.types.SecretStr`; call
+    ``.raw.get_secret_value()`` to inspect it during debugging.
+
     Attributes:
-        raw: The raw lpass output that could not be parsed.
+        raw: The raw lpass output that could not be parsed, wrapped so it is
+             redacted in ``repr()`` and any structlog call that binds it.
     """
 
     def __init__(self, raw: str) -> None:
         """Initialise with the unparseable output.
 
         Args:
-            raw: The raw lpass output string.
+            raw: The raw lpass output string.  Wrapped in a
+                 :class:`~pydantic.types.SecretStr`; only its length appears in
+                 the exception message.
         """
-        self.raw = raw
-        super().__init__(f"Could not parse lpass output: {raw!r}")
+        self.raw = SecretStr(raw)
+        super().__init__(f"Could not parse lpass output ({len(raw)} bytes); see LpassParseError.raw")
 
 
 class LpassTimeoutError(LpassError):

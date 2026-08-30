@@ -159,7 +159,7 @@ All exceptions inherit from `LpassError`.
 | `LpassCommandError` | An `lpass` sub-command exited non-zero. Has `.command`, `.returncode`, `.stderr`. |
 | `LpassItemNotFoundError` | Requested item does not exist. Has `.item_name`. |
 | `LpassMultipleMatchesError` | A name matched more than one item. Has `.item_name`, `.count`. |
-| `LpassParseError` | `lpass show` output could not be parsed. Has `.raw`. |
+| `LpassParseError` | `lpass show` output could not be parsed. Has `.raw` (a `SecretStr` — the unparsed output usually contains the plaintext secret). |
 | `LpassSyncError` | `assert_sync_clean()` found pending or failed uploads. Has `.pending`, `.failed`. |
 | `LpassTimeoutError` | An `lpass` sub-command exceeded the client timeout. Has `.command`, `.timeout`. |
 

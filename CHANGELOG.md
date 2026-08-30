@@ -9,7 +9,8 @@ While the major version is `0`, breaking changes may land in a minor release.
 ## [0.2.0] — 2026-08-29
 
 First public release. Relicensed, and hardened for use by people who are not
-its author.
+its author. The four security fixes marked _(Gemini)_ below were identified by a
+pre-release code review from Google Gemini.
 
 ### Changed
 
@@ -54,6 +55,15 @@ its author.
   closing a hole in strict type checking at the one boundary that handles
   secrets.
 
+- **`LpassParseError.raw` is now a `SecretStr`** rather than a plain `str`. The
+  output that fails to parse is almost always `lpass show --json`, which
+  carries the plaintext password and notes. Call `.raw.get_secret_value()` to
+  inspect it.
+
+- `create()`, `update()`, and `upsert()` now accept `str | SecretStr` for
+  `password` (previously `str`). A `SecretStr` is unwrapped to its plaintext
+  before the write.
+
 ### Added
 
 - **`sync=` keyword on `get_field()`, `get_password()`, and `get_username()`.**
@@ -73,6 +83,21 @@ its author.
 
 ### Fixed
 
+- _(Gemini)_ **`LpassParseError` no longer embeds the unparsed `lpass` output
+  in its message.** That output is `lpass show --json` — plaintext password and
+  notes — and the message lands in tracebacks and log aggregators. The message
+  now carries only a byte count; the content is on `.raw` (a `SecretStr`).
+- _(Gemini)_ **`get_field()`, `get_password()`, and `get_username()` no longer
+  `.strip()` the result.** A password that legitimately begins or ends with a
+  space was silently truncated. Only the CLI's trailing newline is removed now.
+- _(Gemini)_ **Passing a `SecretStr` to `create()`/`update()`/`upsert()` no
+  longer writes the literal string `**********` to LastPass.** The f-string that
+  built the `lpass edit` stdin stringified the `SecretStr` to its mask.
+  `SecretStr` is now unwrapped before the write.
+- _(Gemini)_ **Item names are passed to `lpass` after a `--` end-of-options
+  separator.** A name beginning with `--` was otherwise parsed by `lpass` as a
+  flag. No shell is involved, so this was argument misdirection, not command
+  injection.
 - `get_id()`'s docstring claimed it parsed the `"Item Name [12345]"` first line
   of `lpass show` output. It has delegated to `get_item()` — which reads
   `--json` — since well before this release.
