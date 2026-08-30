@@ -14,8 +14,9 @@ from lpass_wrap import LpassClient, LpassItemNotFoundError
 
 _lpass = LpassClient(username="you@example.com")
 
+
 def main() -> None:
-    _lpass.ensure_login()          # prompts if needed; raises in non-TTY
+    _lpass.ensure_login()  # prompts if needed; raises in non-TTY
     pw = _lpass.get_password("Homelab/My Secret")
     _lpass.upsert("Homelab/My Secret", username="svc", password=new_value)
 ```
@@ -39,7 +40,14 @@ def main() -> None:
 ## Exceptions
 
 ```python
-from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassNotLoggedInError, LpassCommandError, LpassSyncError, LpassTimeoutError
+from lpass_wrap import (
+    LpassItemNotFoundError,
+    LpassMultipleMatchesError,
+    LpassNotLoggedInError,
+    LpassCommandError,
+    LpassSyncError,
+    LpassTimeoutError,
+)
 ```
 
 - `LpassItemNotFoundError` — item name doesn't exist; catch this instead of checking `item_exists()` first when you expect the item to be there.
@@ -57,7 +65,7 @@ the plaintext is explicit:
 
 ```python
 item = _lpass.get_item("Homelab/My Secret")
-log.info("fetched", item=item)          # safe — password renders as **********
+log.info("fetched", item=item)  # safe — password renders as **********
 token = item.password.get_secret_value()  # explicit unwrap
 ```
 

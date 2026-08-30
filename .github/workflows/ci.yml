@@ -1,0 +1,114 @@
+---
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Least privilege: nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A new push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # astral-sh/setup-uv v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uv run ruff check lpass_wrap tests
+
+      - name: Format check (ruff)
+        run: uv run ruff format --check lpass_wrap tests
+
+      - name: Type check (mypy, strict)
+        run: uv run mypy .
+
+      - name: Type check (pyright)
+        run: uv run pyright
+
+      # Every subprocess call is mocked, so this needs neither the lpass
+      # binary nor a LastPass account, and no secrets are configured.
+      - name: Tests
+        run: uv run pytest -v
+
+  hooks:
+    name: pre-commit
+    runs-on: ubuntu-latest
+
+    steps:
+      # actions/checkout v7.0.1 — full history so gitleaks can scan it
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      # astral-sh/setup-uv v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Runs ruff, mypy, and a gitleaks secret scan against every file.
+      # This job is what keeps the hooks from drifting away from CI: the
+      # ruff-format hook also formats Python blocks inside Markdown, which
+      # the directory-scoped check in the test job does not cover.
+      - name: Run pre-commit hooks
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # astral-sh/setup-uv v10.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      # The wheel must carry the licence files and the typing marker, or
+      # downstream consumers silently lose type information.
+      - name: Verify wheel contents
+        run: |
+          python -m zipfile -l dist/*.whl
+          python - <<'PY'
+          import glob, sys, zipfile
+          names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
+          # Matched by suffix so this does not need updating on a version bump.
+          required = ["lpass_wrap/py.typed", "licenses/LICENSE", "licenses/NOTICE"]
+          missing = [r for r in required if not any(n.endswith(r) for n in names)]
+          if missing:
+              sys.exit(f"missing from wheel: {missing}")
+          print("wheel contains LICENSE, NOTICE and py.typed")
+          PY
