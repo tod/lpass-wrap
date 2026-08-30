@@ -1,5 +1,5 @@
 # Copyright 2026 Tod Detre
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 
 """Retrieve an Ansible Vault password from LastPass by vault identity label.
 
@@ -26,7 +26,7 @@ Example ``vault_pass_config.yml``::
 
 import os
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import structlog
 import typer
@@ -174,7 +174,7 @@ def _resolve_vault_id(vault_id: str | None, config: VaultPassConfig, config_path
 @app.command()
 def cli(
     vault_id: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--vault-id",
             metavar="LABEL",

@@ -1,5 +1,5 @@
 # Copyright 2026 Tod Detre
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for the get-ansible-vault-pass-client CLI.
 

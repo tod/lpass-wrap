@@ -12,10 +12,11 @@ If `from lpass_wrap import LpassClient` fails, ask the user where the library is
 ```python
 from lpass_wrap import LpassClient, LpassItemNotFoundError
 
-_lpass = LpassClient(username="tod@tod.net")
+_lpass = LpassClient(username="you@example.com")
+
 
 def main() -> None:
-    _lpass.ensure_login()          # prompts if needed; raises in non-TTY
+    _lpass.ensure_login()  # prompts if needed; raises in non-TTY
     pw = _lpass.get_password("Homelab/My Secret")
     _lpass.upsert("Homelab/My Secret", username="svc", password=new_value)
 ```
@@ -26,26 +27,61 @@ def main() -> None:
 |---|---|
 | `ensure_login()` | Logs in interactively if needed; raises `LpassNotLoggedInError` in non-TTY |
 | `item_exists(name)` | Returns bool; uses `--sync=no` (fast, but stale — avoid for post-write checks) |
-| `get_password(name)` | Returns password field; raises `LpassItemNotFoundError` if missing |
-| `get_username(name)` | Returns username field |
+| `get_password(name, sync=False)` | Returns password field as a plain `str`; raises `LpassItemNotFoundError` if missing. `--sync=no` by default — pass `sync=True` when a stale value would be wrong |
+| `get_username(name, sync=False)` | Returns username field; same caching caveat |
 | `get_item(name)` | Returns `LpassItem`; forces `--sync=now`; raises `LpassMultipleMatchesError` if duplicates exist |
 | `upsert(name, username, password)` | Create or update — uses `get_item()` internally so it is sync-authoritative |
 | `create(name, username, password)` | Explicit create |
 | `update(name, username, password)` | Explicit update; **silently creates** if name not found (prefer `upsert`) |
 | `pending_sync_count()` | Number of items in `upload-queue/` — written locally but not yet pushed |
 | `failed_sync_count()` | Number of items in `upload-fail/` — permanently failed after 5 retries (kept 14 days) |
-| `assert_sync_clean()` | Raises `RuntimeError` if any items are pending or permanently failed; call after all writes |
+| `assert_sync_clean()` | Raises `LpassSyncError` if any items are pending or permanently failed; call after all writes |
 
 ## Exceptions
 
 ```python
-from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassNotLoggedInError, LpassCommandError
+from lpass_wrap import (
+    LpassItemNotFoundError,
+    LpassMultipleMatchesError,
+    LpassNotLoggedInError,
+    LpassCommandError,
+    LpassSyncError,
+    LpassTimeoutError,
+)
 ```
 
 - `LpassItemNotFoundError` — item name doesn't exist; catch this instead of checking `item_exists()` first when you expect the item to be there.
 - `LpassMultipleMatchesError` — raised by `get_item()` (and therefore `upsert()`) when duplicate items share the same name. Has `.item_name` and `.count`. Use `lpass ls` and `lpass rm <UNIQUEID>` to clean up.
 - `LpassNotLoggedInError` — raised by `ensure_login()` in non-TTY sessions; let it propagate.
 - `LpassCommandError` — underlying `lpass` command failed; has `.returncode` and `.stderr`.
+- `LpassSyncError` — raised by `assert_sync_clean()` when writes have not reached the server. Has `.pending` and `.failed` counts.
+- `LpassTimeoutError` — an `lpass` sub-command exceeded the client timeout (60s default). Has `.command` and `.timeout`. Usually means the LastPass server is unreachable; raise it with `LpassClient(timeout=...)` or disable with `timeout=None`.
+
+## Reading secrets off an `LpassItem`
+
+`LpassItem.password` and `LpassItem.notes` are pydantic `SecretStr`, so they
+redact themselves in reprs, `model_dump_json()`, and structlog binds. Reading
+the plaintext is explicit:
+
+```python
+item = _lpass.get_item("Homelab/My Secret")
+log.info("fetched", item=item)  # safe — password renders as **********
+token = item.password.get_secret_value()  # explicit unwrap
+```
+
+The field getters (`get_password`, `get_username`) return plain `str`, not
+`SecretStr` — they exist to hand you the value, so keeping them out of logs is
+the caller's job.
+
+## Stale reads after a rotation
+
+`get_password()` and `get_username()` read the local cache (`--sync=no`) for
+speed and can return the **old** value after a rotation performed on another
+machine or in the web vault. When verifying a rotation, force a server read:
+
+```python
+assert _lpass.get_password(name, sync=True) == new_value
+```
 
 ## Verifying sync in automation scripts
 
@@ -53,10 +89,12 @@ from lpass_wrap import LpassItemNotFoundError, LpassMultipleMatchesError, LpassN
 
 ```python
 _lpass.upsert("Homelab/My Secret", username="svc", password=new_value)
-_lpass.assert_sync_clean()  # raises RuntimeError if pending or failed
+_lpass.assert_sync_clean()  # raises LpassSyncError if pending or failed
 ```
 
-Catch `RuntimeError` in `main()` alongside the other lpass exceptions.
+Catch `LpassSyncError` in `main()` alongside the other lpass exceptions. It
+subclasses `LpassError`, **not** `RuntimeError` — an `except RuntimeError`
+will not catch it.
 
 ### Ansible pattern
 
@@ -69,12 +107,12 @@ Use a task (not a handler — this is a post-condition check, not a change respo
       - python3
       - -c
       - |
-        from lpass_wrap import LpassClient
+        from lpass_wrap import LpassClient, LpassSyncError
         import sys
-        c = LpassClient("tod@tod.net")
+        c = LpassClient("you@example.com")
         try:
             c.assert_sync_clean()
-        except RuntimeError as e:
+        except LpassSyncError as e:
             sys.exit(str(e))
   changed_when: false
 ```

@@ -1,5 +1,5 @@
 # Copyright 2026 Tod Detre
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 
 """lpass-wrap — Python wrapper around the LastPass CLI.
 
@@ -33,6 +33,7 @@ from .exceptions import (
     LpassNotLoggedInError,
     LpassParseError,
     LpassSyncError,
+    LpassTimeoutError,
 )
 from .models import LpassItem
 
@@ -47,5 +48,6 @@ __all__ = [
     "LpassNotLoggedInError",
     "LpassParseError",
     "LpassSyncError",
+    "LpassTimeoutError",
     "setup_logging",
 ]

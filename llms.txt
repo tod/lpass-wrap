@@ -1,0 +1,60 @@
+# lpass-wrap
+
+> A typed Python wrapper around the LastPass CLI (`lpass`) for reading and
+> writing vault items without exposing secrets in process argument lists.
+> Secrets are always passed to `lpass` over stdin; secret-bearing model fields
+> are pydantic `SecretStr` so they cannot leak into logs or tracebacks by
+> accident; every subprocess call is bounded by a timeout. It also exposes the
+> sync diagnostics that `lpass`'s background upload queue makes necessary —
+> without them, a write-then-check script silently creates duplicate vault
+> entries. Ships a console script that serves Ansible Vault passwords via
+> `vault_identity_list`. Python 3.10+, Apache-2.0.
+
+Fastest safe path to first success: install from git, call
+`LpassClient(username=...)`, then `get_password("Some/Item")`. Reads are safe
+and idempotent; do writes with `upsert()` and always follow them with
+`assert_sync_clean()`.
+
+## Docs
+
+- [README](README.md): Install, quick start, full API reference for
+  `LpassClient` and `LpassItem`, the exception hierarchy, sync diagnostics, the
+  Ansible vault-password script, and logging setup. Read this first.
+- [README — AI-agent quickstart](README.md#ai-agent-quickstart): The five rules
+  that matter when generating code against this library. Read before writing
+  any consumer code.
+- [SECURITY.md](SECURITY.md): Threat model — what the library protects against
+  (secrets in argv, secrets in logs, unbounded network waits) and what it
+  explicitly does not (an unlocked vault, a compromised local environment,
+  secrets in memory, explicitly unwrapped values). Read before assuming a
+  security property.
+- [CHANGELOG.md](CHANGELOG.md): Version history. 0.2.0 carries two breaking
+  changes — `SecretStr` fields and subprocess timeouts — each with migration
+  notes. Read when upgrading.
+
+## Contributing
+
+- [AGENTS.md](AGENTS.md): Operational facts for working *on* the repo — setup,
+  the five gates, file layout, and eight rules that will trip you up. Read
+  before editing any source file.
+- [CONTRIBUTING.md](CONTRIBUTING.md): Dev setup, code conventions, test and
+  documentation expectations, commit format.
+
+## Reference
+
+- [Usage notes](.claude/skills/lpass-wrap-usage/SKILL.md): Method-by-method
+  guidance for consumers — which methods sync and which read a stale cache, why
+  `upsert` is the right default, catching `LpassSyncError`, and an Ansible task
+  pattern for verifying sync.
+- [Internals and lpass CLI behaviour](.claude/skills/lpass-wrap-dev/SKILL.md):
+  `$LPASS_HOME` resolution order, the upload-queue and duplicate-entry
+  mechanism, `lpass` CLI log levels, and why create/update is a single
+  `lpass edit` call. Read when debugging sync failures or duplicate items.
+
+## Optional
+
+- [pyproject.toml](pyproject.toml): Dependencies, tool configuration, and the
+  console-script entry point. Note that dev dependencies are PEP 735
+  `[dependency-groups]`, not extras — use `uv sync`, not `pip install -e ".[dev]"`.
+- [tests/test_client.py](tests/test_client.py): Mocking patterns for every
+  `lpass` subprocess call. Copy these rather than inventing new ones.

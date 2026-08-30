@@ -1,7 +1,9 @@
 # Copyright 2026 Tod Detre
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 
 """Exceptions raised by lpass-wrap."""
+
+from pydantic import SecretStr
 
 
 class LpassError(Exception):
@@ -127,15 +129,57 @@ class LpassMultipleMatchesError(LpassError):
 class LpassParseError(LpassError):
     """Raised when lpass output cannot be parsed into an expected format.
 
+    The unparseable output is almost always ``lpass show --json``, which
+    contains the item's plaintext password and notes, so it is **not** placed
+    in the exception message (which lands in tracebacks and logs).  It is kept
+    on ``.raw`` as a :class:`~pydantic.types.SecretStr`; call
+    ``.raw.get_secret_value()`` to inspect it during debugging.
+
     Attributes:
-        raw: The raw lpass output that could not be parsed.
+        raw: The raw lpass output that could not be parsed, wrapped so it is
+             redacted in ``repr()`` and any structlog call that binds it.
     """
 
     def __init__(self, raw: str) -> None:
         """Initialise with the unparseable output.
 
         Args:
-            raw: The raw lpass output string.
+            raw: The raw lpass output string.  Wrapped in a
+                 :class:`~pydantic.types.SecretStr`; only its length appears in
+                 the exception message.
         """
-        self.raw = raw
-        super().__init__(f"Could not parse lpass output: {raw!r}")
+        self.raw = SecretStr(raw)
+        super().__init__(f"Could not parse lpass output ({len(raw)} bytes); see LpassParseError.raw")
+
+
+class LpassTimeoutError(LpassError):
+    """Raised when an lpass sub-command exceeds its allotted wall-clock time.
+
+    Commands that force a server sync (``lpass show --sync=now``, every write)
+    block on the network.  Without a timeout a stalled connection hangs the
+    caller indefinitely — as an Ansible vault-password script, that hangs the
+    whole playbook with no diagnostic.  See ``LpassClient(timeout=...)``.
+
+    Note:
+        The interactive :meth:`~lpass_wrap.client.LpassClient.login` is
+        deliberately exempt: it waits on a human typing a master password.
+
+    Attributes:
+        command: The lpass sub-command that timed out (e.g. 'show', 'edit').
+        timeout: The timeout in seconds that was exceeded.
+    """
+
+    def __init__(self, command: str, timeout: float) -> None:
+        """Initialise with the timed-out command and its limit.
+
+        Args:
+            command: The lpass sub-command that timed out.
+            timeout: The timeout in seconds that was exceeded.
+        """
+        self.command = command
+        self.timeout = timeout
+        super().__init__(
+            f"lpass {command} timed out after {timeout:g}s. "
+            "The LastPass server may be unreachable; raise LpassClient(timeout=...) "
+            "or pass timeout=None to wait indefinitely."
+        )

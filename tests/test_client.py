@@ -1,5 +1,5 @@
 # Copyright 2026 Tod Detre
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for LpassClient.
 
@@ -7,10 +7,12 @@ All tests mock subprocess.run so lpass does not need to be installed.
 """
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import SecretStr
 
 from lpass_wrap import LpassClient, LpassItem
 from lpass_wrap.client import _lpass_data_dir
@@ -21,7 +23,9 @@ from lpass_wrap.exceptions import (
     LpassMultipleMatchesError,
     LpassNotInstalledError,
     LpassNotLoggedInError,
+    LpassParseError,
     LpassSyncError,
+    LpassTimeoutError,
 )
 
 ITEM_NAME = "Homelab/Test Secret"
@@ -146,7 +150,7 @@ class TestGetItem:
         assert item.name == ITEM_NAME
         assert item.item_id == "9876543210"
         assert item.username == "svc"
-        assert item.password == "s3cr3t"
+        assert item.password.get_secret_value() == "s3cr3t"
 
     def test_raises_when_not_found(self) -> None:
         """get_item raises LpassItemNotFoundError on the CLI's 'could not find' message."""
@@ -168,14 +172,45 @@ class TestGetItem:
         assert exc_info.value.count == 2
         assert exc_info.value.item_name == ITEM_NAME
 
+    def test_parse_error_keeps_the_secret_out_of_the_message(self) -> None:
+        """Unparseable --json output holds the plaintext password; it must not
+        land in the exception string, and .raw must be a redacted SecretStr."""
+        leaky = '{"password": "s3cr3t-plaintext" TRUNCATED'
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=leaky)):
+            with pytest.raises(LpassParseError) as exc_info:
+                LpassClient("u@example.com").get_item(ITEM_NAME)
+        assert "s3cr3t-plaintext" not in str(exc_info.value)
+        assert isinstance(exc_info.value.raw, SecretStr)
+        assert exc_info.value.raw.get_secret_value() == leaky
+        assert "s3cr3t-plaintext" not in repr(exc_info.value.raw)
+
+    def test_passes_item_name_positionally_after_a_dash_dash(self) -> None:
+        """An item name starting with '--' must reach lpass as a positional."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=SHOW_JSON)) as mock_run:
+            LpassClient("u@example.com").get_item(ITEM_NAME)
+        cmd = list(mock_run.call_args.args[0])
+        assert cmd[-2:] == ["--", ITEM_NAME]
+
 
 class TestGetField:
     """Tests for LpassClient.get_field."""
 
-    def test_returns_stripped_value(self) -> None:
-        """get_field returns the field value with surrounding whitespace stripped."""
+    def test_strips_only_the_trailing_newline(self) -> None:
+        """get_field removes the CLI's line terminator and nothing else."""
         with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")):
             assert LpassClient("u@example.com").get_field(ITEM_NAME, "--password") == "s3cr3t"
+
+    def test_preserves_leading_and_trailing_spaces_in_the_value(self) -> None:
+        """A password with edge whitespace survives — .strip() would corrupt it."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="  pass phrase \n")):
+            assert LpassClient("u@example.com").get_field(ITEM_NAME, "--password") == "  pass phrase "
+
+    def test_passes_item_name_positionally_after_a_dash_dash(self) -> None:
+        """An item name starting with '--' must not be parsed by lpass as a flag."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")) as mock_run:
+            LpassClient("u@example.com").get_field("--not-a-flag", "--password")
+        cmd = list(mock_run.call_args.args[0])
+        assert cmd[-2:] == ["--", "--not-a-flag"]
 
     def test_raises_not_found_on_could_not_find_stderr(self) -> None:
         """get_field maps the CLI's 'could not find' message to LpassItemNotFoundError."""
@@ -197,25 +232,25 @@ class TestLpassDataDir:
         """$LPASS_HOME takes precedence over everything else."""
         env = {"LPASS_HOME": str(tmp_path), "XDG_DATA_HOME": "/xdg/data", "HOME": "/home/u"}
         with patch.dict("os.environ", env, clear=True):
-            assert _lpass_data_dir() == str(tmp_path)
+            assert _lpass_data_dir() == tmp_path
 
     def test_xdg_data_home_wins_without_runtime_dir(self) -> None:
         """$XDG_DATA_HOME is honoured even when $XDG_RUNTIME_DIR is unset."""
         env = {"XDG_DATA_HOME": "/xdg/data", "HOME": "/home/u"}
         with patch.dict("os.environ", env, clear=True):
-            assert _lpass_data_dir() == "/xdg/data/lpass"
+            assert _lpass_data_dir() == Path("/xdg/data/lpass")
 
     def test_runtime_dir_implies_local_share_default(self) -> None:
         """$XDG_RUNTIME_DIR set without $XDG_DATA_HOME resolves to ~/.local/share/lpass."""
         env = {"XDG_RUNTIME_DIR": "/run/user/1000", "HOME": "/home/u"}
         with patch.dict("os.environ", env, clear=True):
-            assert _lpass_data_dir() == "/home/u/.local/share/lpass"
+            assert _lpass_data_dir() == Path("/home/u/.local/share/lpass")
 
     def test_legacy_fallback_without_any_xdg(self) -> None:
         """With no LPASS_HOME and no XDG variables, falls back to ~/.lpass."""
         env = {"HOME": "/home/u"}
         with patch.dict("os.environ", env, clear=True):
-            assert _lpass_data_dir() == "/home/u/.lpass"
+            assert _lpass_data_dir() == Path("/home/u/.lpass")
 
 
 class TestCreate:
@@ -294,6 +329,37 @@ class TestUpdate:
             client.update(ITEM_NAME, username="", password="newpass")
 
         assert stdins == ["Password: newpass\n"]
+
+    def test_unwraps_a_secretstr_password(self) -> None:
+        """Passing item.password (a SecretStr) must write the plaintext, not '**********'."""
+        client = LpassClient("u@example.com")
+        stdins: list[str] = []
+
+        def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            if "edit" in cmd:
+                stdins.append(str(kwargs.get("input", "")))
+            return _make_proc(0, stdout=SHOW_JSON)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.update(ITEM_NAME, username="svc", password=SecretStr("s3cr3t"))
+
+        assert "Password: s3cr3t" in stdins[0]
+        assert "**********" not in stdins[0]
+
+    def test_passes_item_name_positionally_after_a_dash_dash(self) -> None:
+        """lpass edit must receive an item name via a positional, not as a flag."""
+        client = LpassClient("u@example.com")
+        edit_cmds: list[list[str]] = []
+
+        def mock_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            if "edit" in cmd:
+                edit_cmds.append(list(cmd))
+            return _make_proc(0, stdout=SHOW_JSON)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.update(ITEM_NAME, username="svc", password="newpass")
+
+        assert edit_cmds[0][-2:] == ["--", ITEM_NAME]
 
 
 class TestUpsert:
@@ -447,3 +513,149 @@ class TestItemFromJsonFullname:
         with patch("subprocess.run", return_value=_make_proc(0, stdout=payload)):
             item = LpassClient("u@example.com").get_item(ITEM_NAME)
         assert item.name == ITEM_NAME
+
+
+class TestSecretRedaction:
+    """Tests that secret-bearing fields never render in plaintext (S1).
+
+    The library exists to keep secrets out of process listings; leaking them
+    into logs and tracebacks through a model repr would undo that.
+    """
+
+    def test_password_is_a_secretstr(self) -> None:
+        """A plain string passed to the model is coerced to SecretStr by pydantic."""
+        item = LpassItem(name=ITEM_NAME, password=SecretStr("s3cr3t"))
+        assert isinstance(item.password, SecretStr)
+        assert item.password.get_secret_value() == "s3cr3t"
+
+    def test_password_absent_from_repr_and_str(self) -> None:
+        """repr() and str() of an item must not contain the plaintext password."""
+        item = LpassItem(name=ITEM_NAME, username="svc", password=SecretStr("s3cr3t"))
+        assert "s3cr3t" not in repr(item)
+        assert "s3cr3t" not in str(item)
+
+    def test_password_absent_from_model_dumps(self) -> None:
+        """model_dump() and model_dump_json() must not leak the plaintext password."""
+        item = LpassItem(name=ITEM_NAME, username="svc", password=SecretStr("s3cr3t"))
+        assert "s3cr3t" not in str(item.model_dump())
+        assert "s3cr3t" not in item.model_dump_json()
+
+    def test_notes_are_redacted_too(self) -> None:
+        """Notes can hold recovery codes and API keys, so they are secret as well."""
+        item = LpassItem(name=ITEM_NAME, notes=SecretStr("recovery-code-42"))
+        assert "recovery-code-42" not in repr(item)
+        assert "recovery-code-42" not in item.model_dump_json()
+        assert item.notes.get_secret_value() == "recovery-code-42"
+
+    def test_item_from_json_wraps_secrets(self) -> None:
+        """An item built from real lpass --json output carries wrapped secrets."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=SHOW_JSON)):
+            item = LpassClient("u@example.com").get_item(ITEM_NAME)
+        assert isinstance(item.password, SecretStr)
+        assert isinstance(item.notes, SecretStr)
+        assert "s3cr3t" not in repr(item)
+
+    def test_with_password_wraps_a_plain_string(self) -> None:
+        """model_copy does not re-validate, so with_password must wrap str itself.
+
+        Regression guard: an unwrapped str would sit in a SecretStr field and
+        blow up at the .get_secret_value() call site instead of here.
+        """
+        item = LpassItem(name=ITEM_NAME, password=SecretStr("old")).with_password("new")
+        assert isinstance(item.password, SecretStr)
+        assert item.password.get_secret_value() == "new"
+        assert "new" not in repr(item)
+
+    def test_with_password_accepts_a_secretstr(self) -> None:
+        """An already-wrapped SecretStr is passed through unchanged."""
+        item = LpassItem(name=ITEM_NAME).with_password(SecretStr("new"))
+        assert item.password.get_secret_value() == "new"
+
+
+class TestTimeout:
+    """Tests for the subprocess timeout plumbing (S2)."""
+
+    def test_default_timeout_passed_to_subprocess(self) -> None:
+        """Every non-interactive command runs under the 60s default timeout."""
+        with patch("subprocess.run", return_value=_make_proc(0)) as mock_run:
+            LpassClient("u@example.com").is_logged_in()
+        assert mock_run.call_args.kwargs["timeout"] == 60.0
+
+    def test_custom_timeout_is_honoured(self) -> None:
+        """A client-level timeout overrides the default on every call."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout=SHOW_JSON)) as mock_run:
+            LpassClient("u@example.com", timeout=5.0).get_item(ITEM_NAME)
+        assert mock_run.call_args.kwargs["timeout"] == 5.0
+
+    def test_timeout_none_waits_indefinitely(self) -> None:
+        """timeout=None restores the unbounded pre-0.2 behaviour."""
+        with patch("subprocess.run", return_value=_make_proc(0)) as mock_run:
+            LpassClient("u@example.com", timeout=None).is_logged_in()
+        assert mock_run.call_args.kwargs["timeout"] is None
+
+    def test_expired_timeout_raises_lpass_timeout_error(self) -> None:
+        """subprocess.TimeoutExpired is translated into the library's error type."""
+        exc = subprocess.TimeoutExpired(cmd=["lpass", "show"], timeout=60.0)
+        with patch("subprocess.run", side_effect=exc):
+            with pytest.raises(LpassTimeoutError) as excinfo:
+                LpassClient("u@example.com").get_item(ITEM_NAME)
+        assert excinfo.value.command == "show"
+        assert excinfo.value.timeout == 60.0
+
+    def test_timeout_on_the_write_path(self) -> None:
+        """The stdin write path reports the edit sub-command when it times out."""
+        exc = subprocess.TimeoutExpired(cmd=["lpass", "edit"], timeout=60.0)
+        with patch("subprocess.run", side_effect=exc):
+            with pytest.raises(LpassTimeoutError) as excinfo:
+                LpassClient("u@example.com").create(ITEM_NAME, "svc", "s3cr3t")
+        assert excinfo.value.command == "edit"
+
+    def test_timeout_error_is_an_lpass_error(self) -> None:
+        """LpassTimeoutError participates in the LpassError hierarchy."""
+        assert issubclass(LpassTimeoutError, LpassError)
+
+    def test_login_is_never_timed_out(self) -> None:
+        """The interactive login waits on a human and must not carry a timeout."""
+        with patch("subprocess.run", return_value=_make_proc(0)) as mock_run:
+            LpassClient("u@example.com").login()
+        assert mock_run.call_args.kwargs["timeout"] is None
+
+
+class TestSyncOptIn:
+    """Tests for the opt-in freshness flag on the cached field getters (S3)."""
+
+    def _flags(self, mock_run: MagicMock) -> list[str]:
+        """Return the command list from the single recorded subprocess call."""
+        return list(mock_run.call_args.args[0])
+
+    def test_get_field_defaults_to_cached_read(self) -> None:
+        """Without sync=, get_field reads the local blob for speed."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")) as mock_run:
+            LpassClient("u@example.com").get_field(ITEM_NAME, "--password")
+        assert "--sync=no" in self._flags(mock_run)
+
+    def test_get_field_sync_true_forces_server_read(self) -> None:
+        """sync=True upgrades the read to --sync=now."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")) as mock_run:
+            LpassClient("u@example.com").get_field(ITEM_NAME, "--password", sync=True)
+        flags = self._flags(mock_run)
+        assert "--sync=now" in flags
+        assert "--sync=no" not in flags
+
+    def test_get_password_forwards_sync(self) -> None:
+        """get_password passes sync= through to get_field — the rotation case."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")) as mock_run:
+            LpassClient("u@example.com").get_password(ITEM_NAME, sync=True)
+        assert "--sync=now" in self._flags(mock_run)
+
+    def test_get_username_forwards_sync(self) -> None:
+        """get_username passes sync= through to get_field."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="svc\n")) as mock_run:
+            LpassClient("u@example.com").get_username(ITEM_NAME, sync=True)
+        assert "--sync=now" in self._flags(mock_run)
+
+    def test_get_password_defaults_to_cached_read(self) -> None:
+        """The default stays --sync=no, so existing callers keep their speed."""
+        with patch("subprocess.run", return_value=_make_proc(0, stdout="s3cr3t\n")) as mock_run:
+            LpassClient("u@example.com").get_password(ITEM_NAME)
+        assert "--sync=no" in self._flags(mock_run)

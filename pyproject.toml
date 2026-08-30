@@ -4,15 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lpass-wrap"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python wrapper around the LastPass CLI (lpass)"
 readme = "README.md"
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Tod Detre", email = "tod@tod.net" },
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",
@@ -37,6 +38,7 @@ get-ansible-vault-pass-client = "lpass_wrap.get_ansible_vault_pass_cli:main"
 [dependency-groups]
 dev = [
     "mypy>=1.10",
+    "pre-commit>=3.5",
     "pytest>=8.0",
     "pyright>=1.1",
     "ruff>=0.4",
